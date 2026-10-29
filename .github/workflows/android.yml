@@ -55,7 +55,6 @@ jobs:
           SO=android/app/src/main/jniLibs/arm64-v8a/libbeayy_mobile.so
           test -f "$SO" || { echo "::error::没有产出 .so"; exit 1; }
           for sym in \
-          for sym in \
             Java_app_beayy_android_BeayyBridge_jniCall \
             Java_app_beayy_android_BeayyBridge_jniCapture \
             Java_app_beayy_android_BeayyBridge_jniStart \
@@ -93,6 +92,9 @@ jobs:
           java-version: '21'
       - uses: android-actions/setup-android@v3
 
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:

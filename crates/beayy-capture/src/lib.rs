@@ -50,9 +50,13 @@ pub fn permissions() -> PermissionStatus {
             full_disk_access: true,
         }
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         platform_impl::permissions()
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
+    {
+        PermissionStatus { accessibility: true, input_monitoring: true, full_disk_access: true }
     }
 }
 
@@ -65,9 +69,13 @@ pub fn open_permission(kind: &str) {
     {
         let _ = kind;
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         platform_impl::open_permission(kind)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = kind;
     }
 }
 
