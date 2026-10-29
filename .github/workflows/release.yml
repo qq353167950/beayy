@@ -72,6 +72,10 @@ jobs:
           distribution: temurin
           java-version: "21"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
       - uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27
