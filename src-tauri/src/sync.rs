@@ -43,6 +43,8 @@ pub fn start(log: Arc<EventLog>) {
     std::thread::spawn(move || loop {
         run(Some(&log));
         pull_profile();
+        // 模型配置跟着账号走：本机改过就推、别的设备改过就拉（密钥不在这块里）
+        let _ = beayy_remote::cloud::sync_model_profile(&data_root());
         // 等 5 分钟，期间页面点了「立即同步」就提前跑
         let mut waited = Duration::ZERO;
         while waited < EVERY {

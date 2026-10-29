@@ -1,0 +1,134 @@
+# Android 构建与 Rust 跨目标校验
+#
+# 两件事：
+# 1. Rust 侧真能交叉编译到 Android（rustls，不是 native-tls）——这一步最容易被改坏，
+#    因为 crates/beayy-capture/src/android 在非 Android 目标下被 cfg 排除，
+#    普通 `cargo check` 根本看不到它。
+# 2. Kotlin/Gradle 侧能打出 APK。
+#
+# 两者都过了，才说明「Android 版没坏」。
+
+name: android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Rust 侧：aarch64-linux-android 交叉编译
+  rust-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-aarch64
+
+      - name: 装 NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27
+
+      - name: 装 cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # 关键：必须 --no-default-features --features rustls。
+      # 默认 feature 是 native-tls，会拉 openssl-sys，Android NDK 上没有 OpenSSL，直接编不过。
+      - name: 编 Rust 库（arm64-v8a）
+        run: |
+          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs \
+            build --release -p beayy-mobile \
+            --no-default-features --features rustls
+
+      - name: 断言 JNI 符号都在
+        run: |
+          NM="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          SO=android/app/src/main/jniLibs/arm64-v8a/libbeayy_mobile.so
+          test -f "$SO" || { echo "::error::没有产出 .so"; exit 1; }
+          for sym in \
+          for sym in \
+            Java_app_beayy_android_BeayyBridge_jniCall \
+            Java_app_beayy_android_BeayyBridge_jniCapture \
+            Java_app_beayy_android_BeayyBridge_jniStart \
+            Java_app_beayy_android_BeayyBridge_setDataRoot; do
+            "$NM" -D --defined-only "$SO" | grep -q "$sym" \
+              || { echo "::error::缺少 JNI 符号 $sym（Kotlin 会在 System.loadLibrary 后崩）"; exit 1; }
+          done
+          echo "JNI 符号齐全"
+
+      # 顺带确认没有把 native-tls／openssl 拖进来
+      - name: 断言没链 openssl
+        run: |
+          if cargo tree -p beayy-mobile --no-default-features --features rustls \
+               --target aarch64-linux-android -i openssl-sys 2>&1 | grep -q openssl-sys; then
+            echo "::error::Android 构建里出现了 openssl-sys（说明某个 crate 的 default feature 没关）"
+            exit 1
+          fi
+          echo "没有 openssl 依赖"
+
+  # Kotlin/Gradle 侧：出 APK
+  apk:
+    runs-on: ubuntu-latest
+    needs: rust-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-aarch64
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27
+      - run: cargo install cargo-ndk --locked
+
+      - name: 编 Rust 库
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -o android/app/src/main/jniLibs \
+            build --release -p beayy-mobile \
+            --no-default-features --features rustls
+
+      - name: 打 APK
+        working-directory: android
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          if [ -f gradlew ]; then ./gradlew assembleDebug --no-daemon; else gradle assembleDebug --no-daemon; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beayy-android-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  # 桌面侧不回归：改了 TLS feature 之类容易把 mac/win 弄坏
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 装 Linux 上 Tauri 要的系统库
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: 默认 feature（native-tls）要能编
+        run: cargo check --workspace
+      - name: 测试
+        run: cargo test --workspace

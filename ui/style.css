@@ -105,7 +105,11 @@ body { padding: 0; overflow: hidden; }
 /* ---------- 时间线：电脑、手机按时间穿插，新的在上 ---------- */
 .tl-row { position: relative; border-bottom: 1px solid var(--line); }
 .tl-row > summary, div.tl-row { display: grid; grid-template-columns: 92px minmax(0, 1fr) 16px; gap: var(--space-3); padding: 12px; }
-.tl-row > summary { border-radius: var(--radius-lg); }
+details.tl-row > summary { border-radius: var(--radius-lg); min-width: 0; }
+details.tl-row { min-width: 0; }
+details.tl-row > summary > span:nth-child(2) { min-width: 0; overflow-wrap: anywhere; }
+details.tl-row .more { min-width: 0; overflow-wrap: anywhere; }
+details.tl-row .more pre { max-width: 100%; box-sizing: border-box; white-space: pre-wrap; overflow-wrap: anywhere; }
 div.tl-row { grid-template-columns: 92px minmax(0, 1fr); }
 .tl-row > summary { list-style: none; cursor: pointer; }
 .tl-row > summary::-webkit-details-marker { display: none; }
@@ -243,7 +247,17 @@ div.tl-row { grid-template-columns: 92px minmax(0, 1fr); }
 .form .mx-sec + .mx-sec { margin-top: var(--space-6); }
 .form .mx-setting:last-child { border-bottom: 0; }
 .mx-input { width: 100%; }
-.mx-input.mono { font: 13px/20px var(--font-mono); }
+.android-setting-label { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+.android-setting-icon { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; flex: 0 0 22px; color: var(--ink-3); }
+.android-setting-icon .mx-ico { width: 20px; height: 20px; }
+.android-setting-label > span:last-child { min-width: 0; }
+.android-setting-row { flex-wrap: nowrap !important; align-items: flex-start; }
+.android-setting-row .mx-setting-main { flex: 1 1 0; width: 0; min-width: 0; }
+.android-setting-label { flex-wrap: nowrap; white-space: nowrap; }
+.storage-path { display: inline-block; max-width: 100%; min-width: 0; overflow-wrap: anywhere; word-break: break-all; white-space: normal; }
+.form, .form .mx-sec, .form .mx-setting, .form .mx-setting-main { min-width: 0; max-width: 100%; }
+.android-setting-row .mx-setting-main { min-width: 0; }
+.android-setting-row > .mx-status, .android-setting-row > .mx-btn, .android-setting-row > .mx-switch { flex: 0 0 auto; }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
 .inline { display: flex; gap: var(--space-2); }
 .inline .mx-input { flex: 1; }
@@ -366,8 +380,10 @@ a.mx-btn { text-decoration: none; }
 /* ---------- 头像和名称、项目 ---------- */
 .profile { display: flex; align-items: center; gap: var(--space-3); }
 .pj-group { padding: var(--space-4) 0 4px; font-size: 12px; color: var(--ink-4); }
-.pj-row { display: flex; gap: var(--space-2); align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.profile-setting { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: 14px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.profile-setting .profile { flex: 1; min-width: 0; }
 .pj-main { flex: 1; min-width: 0; }
+.pj-row { display: flex; gap: var(--space-2); align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .pj-row [data-pj-edit] { opacity: 0; }
 .pj-row:hover [data-pj-edit], .pj-row [data-pj-edit]:focus-visible { opacity: 1; }
 .pj + .mx-field-error { margin-top: var(--space-2); }
@@ -445,10 +461,10 @@ a.mx-btn { text-decoration: none; }
 .ev-row .t { font-size: 12px; color: var(--ink-4); font-variant-numeric: tabular-nums; }
 .ev-row .mx-tag { justify-self: start; white-space: nowrap; }
 .ev-row .ico-none { background: none; }
-.ev-say { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-say { min-width: 0; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: anywhere; }
 .ev-row[open] .ev-say { white-space: normal; }
-.ev-more { padding: 0 8px 12px calc(64px + 12px); display: flex; flex-direction: column; gap: var(--space-2); }
-.ev-more pre { margin: 0; padding: 10px 12px; border-radius: var(--radius-md); background: var(--sunken); border: 1px solid var(--line); font-size: 12px; line-height: 18px; color: var(--ink-2); white-space: pre-wrap; word-break: break-all; max-height: 360px; overflow: auto; }
+.ev-more { min-width: 0; padding: 0 8px 12px calc(64px + 12px); display: flex; flex-direction: column; gap: var(--space-2); }
+.ev-more pre { margin: 0; padding: 10px 12px; border-radius: var(--radius-md); background: var(--sunken); border: 1px solid var(--line); font-size: 12px; line-height: 18px; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; box-sizing: border-box; max-height: 360px; overflow: auto; }
 .ev-more .ev-text { font-family: var(--font-sans); font-size: 13px; color: var(--ink); }
 .ev-older { justify-content: center; margin: var(--space-4) 0; }
 .mx-sec .mx-list .mx-row:last-child { border-bottom-color: transparent; }
@@ -595,5 +611,47 @@ a.mx-btn { text-decoration: none; }
   .strip-axis span.t small { display: none; } /* 窄屏只写小时，免得挤在一起 */
   .mx-setting { flex-wrap: wrap; }
   .mx-setting .btns { flex-wrap: wrap; }
+  .android-setting-row { flex-wrap: wrap !important; }
+  .android-setting-row .mx-setting-main { flex: 1 1 100%; width: 100%; }
+  .android-setting-row > .mx-status { margin-left: 32px; }
   .mx-dialog { width: calc(100vw - 24px) !important; max-width: none; }
 }
+
+/* 模型没配好的常驻横幅：模型没配就不会生成摘要，而摘要失败是静默的（只写日志），
+   所以要在界面上明说，不然用户会以为没这个功能。 */
+.model-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: #fff6e5;
+  border: 1px solid #f0d9a8;
+  color: #6b4a00;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.model-banner-text { flex: 1; }
+.model-banner-go {
+  flex: none;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid #d9a94a;
+  background: #fff;
+  color: #6b4a00;
+  font-size: 13px;
+  cursor: pointer;
+}
+.model-banner-go:hover { background: #fdf0d5; }
+.model-banner-x {
+  flex: none;
+  border: none;
+  background: none;
+  color: #a5824a;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.model-banner-x:hover { color: #6b4a00; }

@@ -129,7 +129,7 @@ fn read_phone_events() -> Vec<PhoneEv> {
     let mut out = Vec::new();
     let devices = default_root().join("devices");
     let Ok(devs) = fs::read_dir(&devices) else { return out };
-    for dev in devs.filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("iphone-")) {
+    for dev in devs.filter_map(|e| e.ok()).filter(|e| beayy_core::is_phone(&e.file_name().to_string_lossy())) {
         let Ok(segs) = fs::read_dir(dev.path().join("segments")) else { continue };
         for seg in segs.filter_map(|e| e.ok()) {
             let Ok(bytes) = fs::read(seg.path().join("events.jsonl")) else { continue };
@@ -338,6 +338,7 @@ fn self_segments() -> HashMap<String, Vec<Value>> {
             .map(|c| c[1].lines().filter(|l| l.starts_with("- ")).map(|l| l[2..].trim().to_string()).collect())
             .unwrap_or_default();
         let date = start.with_timezone(&Local).format("%Y-%m-%d").to_string();
+
         let fm = beayy_summary::front(&md);
         out.entry(date).or_default().push(json!({
             "active_sec": fm.get("active_sec").cloned().unwrap_or(Value::Null),
@@ -459,12 +460,16 @@ const MERGE_GAP: f64 = 20.0;
 /// 录音分段之间空档超过 5 分钟记为断档
 const REC_GAP: f64 = 300.0;
 
-/// 某种设备（watch-、iphone-）在 [from, to) 里的事件：只读这段时间的分段目录
-fn device_events(prefix: &str, types: &[&str], from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Value> {
+/// 某种设备（`watch-`、手机家族）在 [from, to) 里的事件：只读这段时间的分段目录。
+/// `prefixes` 给一组前缀，任一个命中就算（手机给 [beayy_core::PHONE_PREFIXES]，一次覆盖 iPhone 和 Android）。
+fn device_events_any(prefixes: &[&str], types: &[&str], from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Value> {
     let mut out = vec![];
     let (lo, hi) = (beayy_core::segment_key(from), beayy_core::segment_key(to));
     let Ok(devs) = fs::read_dir(default_root().join("devices")) else { return out };
-    for dev in devs.filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with(prefix)) {
+    for dev in devs.filter_map(|e| e.ok()).filter(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        prefixes.iter().any(|p| n.starts_with(p))
+    }) {
         let Ok(segs) = fs::read_dir(dev.path().join("segments")) else { continue };
         for seg in segs.filter_map(|e| e.ok()) {
             let n = seg.file_name().to_string_lossy().to_string();
@@ -504,9 +509,9 @@ fn is_self(speaker: &str) -> bool {
 pub fn speech_day(date: NaiveDate) -> Option<Value> {
     let (s, e) = day_bounds(date);
     let (s, e) = (s.with_timezone(&Utc), e.with_timezone(&Utc));
-    let mut ev = device_events("watch-", &["speech.segment", "speech.utterance"], s - Duration::minutes(10), e);
-    ev.extend(device_events("iphone-", &["speech.segment", "speech.utterance"], s - Duration::minutes(10), e));
-    if ev.is_empty() && !has_device("watch-") {
+    let mut ev = device_events_any(&[beayy_core::WATCH_PREFIX], &["speech.segment", "speech.utterance"], s - Duration::minutes(10), e);
+    ev.extend(device_events_any(&beayy_core::PHONE_PREFIXES, &["speech.segment", "speech.utterance"], s - Duration::minutes(10), e));
+    if ev.is_empty() && !has_device(beayy_core::WATCH_PREFIX) {
         return None;
     }
     let inday = |x: &Value| ts_of(&x["start"]).map(|t| t >= s && t < e).unwrap_or(false);
@@ -818,8 +823,8 @@ pub fn places_day_opt(date: NaiveDate, online: bool) -> Option<Value> {
     let (s, e) = day_bounds(date);
     let (s, e) = (s.with_timezone(&Utc), e.with_timezone(&Utc));
     // 到达在前一天的也读（在家过夜）
-    let mut ev = device_events("iphone-", &["place.visit"], s - Duration::days(2), e);
-    ev.extend(device_events("watch-", &["place.visit"], s - Duration::days(2), e));
+    let mut ev = device_events_any(&beayy_core::PHONE_PREFIXES, &["place.visit"], s - Duration::days(2), e);
+    ev.extend(device_events_any(&[beayy_core::WATCH_PREFIX], &["place.visit"], s - Duration::days(2), e));
     if ev.is_empty() {
         return None;
     }
@@ -1119,6 +1124,8 @@ pub fn get_day(date: String) -> Value {
         "phone": phone_day(phone_events().as_slice(), nd, &app_names()),
         "speech": speech_day(nd),
         "places": places_day(nd),
+        // 手机独有的信号（通知/媒体/电量/网络）：只有 Android 采得到
+        "phone_extra": phone_extra_day(date.clone()),
     })
 }
 
@@ -1266,13 +1273,21 @@ pub fn get_settings() -> Value {
         "has_amap_key": beayy_core::secret_get(crate::amap::SECRET).is_some(),
         "map_mode": if crate::amap::official() { "official" } else { "custom" },
         "has_amap_js": beayy_core::secret_get("amap_js_key").is_some() && beayy_core::secret_get("amap_js_code").is_some(),
+        // Android 独有：后台常驻时藏掉通知栏（不藏的话用户会看到「正在记录」）
+        "hide_ongoing": s.get("hide_ongoing").and_then(Value::as_bool).unwrap_or(false),
+        // 「挂了自动拉起来」默认开：采集断了比多跑一次更糟
+        "keep_alive": s.get("keep_alive").and_then(Value::as_bool).unwrap_or(true),
+        // 从「最近任务」里隐藏（多任务界面看不到 Beayy）
+        "hide_recents": s.get("hide_recents").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
 #[cfg_attr(not(beayy_mobile), tauri::command)]
 pub fn save_settings(settings: Value) -> Result<(), String> {
     let mut s = read_settings_raw();
-    let map = [("gateway", "gateway"), ("model_segment", "summary_model"), ("model_daily", "daily_model"), ("repo_path", "repo_path"), ("blocklist", "blacklist"), ("onboarded", "onboarded"), ("relay_server", "relay_server"), ("sync_server", "sync_server"), ("transcribe_server", "transcribe_server"), ("speaker_name", "speaker_name"), ("model_mode", "model_mode"), ("map_mode", "map_mode")];
+    let map = [("gateway", "gateway"), ("model_segment", "summary_model"), ("model_daily", "daily_model"), ("repo_path", "repo_path"), ("blocklist", "blacklist"), ("onboarded", "onboarded"), ("relay_server", "relay_server"), ("sync_server", "sync_server"), ("transcribe_server", "transcribe_server"), ("speaker_name", "speaker_name"), ("model_mode", "model_mode"), ("map_mode", "map_mode"), ("hide_ongoing", "hide_ongoing"), ("keep_alive", "keep_alive"), ("hide_recents", "hide_recents")];
+    // 改模型相关的这几项时打个时间戳：同步时拿它和别的设备的配置比新旧。密钥不算在里面（它不同步）
+    let before = beayy_core::model_config::ModelProfile::from_settings(&s);
     for (from, to) in map {
         if let Some(mut v) = settings.get(from).cloned() {
             // 同步服务器、转写服务填的就是官方的，存成空（官方地址以后变了跟着变）
@@ -1283,6 +1298,10 @@ pub fn save_settings(settings: Value) -> Result<(), String> {
             }
             s.insert(to.into(), v);
         }
+    }
+    let after = beayy_core::model_config::ModelProfile::from_settings(&s);
+    if after.mode != before.mode || after.gateway != before.gateway || after.model_segment != before.model_segment || after.model_daily != before.model_daily {
+        s.insert("model_updated".into(), json!(chrono::Utc::now().timestamp_millis()));
     }
     fs::create_dir_all(default_root()).map_err(|e| e.to_string())?;
     fs::write(settings_path(), serde_json::to_string_pretty(&Value::Object(s)).unwrap()).map_err(|e| e.to_string())
@@ -1584,19 +1603,76 @@ pub fn set_project_domain(project: String, domain: String) -> Result<(), String>
 }
 
 /// 首次引导里「测试一下」：用现在的网关、模型、密钥问一句
-/// 官方服务（模型、转写、地图）在这个账号上开通了没有、本月各用了多少：
-/// {plan: null|"official"|"stopped", month, llm: {used, quota}, asr: {used, quota}（秒）, map: {used, quota}（次）}；没登录返回 {error}
+/// 模型的当前状态：**本机配置** 和 **账号额度** 分开报，别混在一起。
+/// - 本机：mode／gateway／model／has_key／ready（ready=false 时 missing 说明缺什么）
+/// - 账号：只有 mode=official 且登录了才去问；没登录就是 quota: null，不当成错误
+///
+/// 以前这里直接调 beayy_sync::account()，没登录就返回 {"error":"没登录"}——
+/// 可用户用自己的网关是完全不需要账号的，那个 error 会被界面当成「模型坏了」。
 #[cfg_attr(not(beayy_mobile), tauri::command)]
 pub async fn llm_status() -> Value {
-    match beayy_sync::account(&beayy_core::data_root()) {
-        Ok(a) => a.get("services").cloned().unwrap_or(json!({"plan": null})),
-        Err(e) => json!({"error": e}),
+    let s = read_settings_raw();
+    let p = beayy_core::model_config::ModelProfile::from_settings(&s);
+    let has_key = beayy_summary::api_key_source().is_some();
+    let mut missing = p.problems();
+    if p.mode == "custom" && !has_key {
+        missing.push("key");
     }
+    let local = json!({
+        "mode": p.mode,
+        "gateway": p.gateway,
+        "model_segment": p.model_segment,
+        "model_daily": p.daily_or_segment(),
+        "has_key": has_key,
+        "api_key_source": beayy_summary::api_key_source(),
+        "ready": missing.is_empty(),
+        "missing": missing,
+        "updated": p.updated,
+    });
+    // 官方模式才去问账号额度；自己的网关跟账号没关系，不查
+    let quota = if p.mode == "official" {
+        match beayy_sync::account(&beayy_core::data_root()) {
+            Ok(a) => a.get("services").cloned().unwrap_or(json!({"plan": null})),
+            // 没登录／连不上：官方额度就是没有，不是错误
+            Err(_) => json!({"plan": null}),
+        }
+    } else {
+        Value::Null
+    };
+    json!({ "local": local, "quota": quota })
 }
 
 #[cfg_attr(not(beayy_mobile), tauri::command)]
 pub async fn test_model() -> Result<(), String> {
     beayy_summary::Summarizer::new(default_root()).ask("只返回一个 JSON 对象：{\"ok\": true}", "测试连接").map(|_| ())
+}
+
+/// 模型配好了没有——界面拿它决定要不要挂「未配置，不会生成摘要」的横幅。
+/// 返回 {ready, missing: [gateway|model|key], mode, message}
+#[cfg_attr(not(beayy_mobile), tauri::command)]
+pub fn model_ready() -> Value {
+    let s = read_settings_raw();
+    let p = beayy_core::model_config::ModelProfile::from_settings(&s);
+    let has_key = beayy_summary::api_key_source().is_some();
+    let mut missing = p.problems();
+    if p.mode == "custom" && !has_key {
+        missing.push("key");
+    }
+    let message = if missing.is_empty() {
+        String::new()
+    } else if missing.iter().any(|m| *m == "model") {
+        "还没选模型，不会生成摘要。到「设置 → 模型」填一个模型名。".into()
+    } else if missing.iter().any(|m| *m == "key") {
+        "模型配好了但没有密钥，不会生成摘要。到「设置 → 模型」填上密钥。".into()
+    } else {
+        "模型的网关地址是空的，不会生成摘要。到「设置 → 模型」填上地址。".into()
+    };
+    json!({
+        "ready": missing.is_empty(),
+        "missing": missing,
+        "mode": p.mode,
+        "message": message,
+    })
 }
 
 /// 还没做过首次引导（主窗口启动时直接打开）
@@ -1607,4 +1683,71 @@ pub fn needs_onboarding() -> bool {
 /// 给 MCP 搜索用：全部 10 分钟摘要，按本地日期分组
 pub fn self_segments_pub() -> HashMap<String, Vec<Value>> {
     self_segments()
+}
+
+
+/// 手机上的「额外信号」：通知、媒体播放、电量、网络。都是 Android 独有、
+/// 桌面和 iOS 没有的事件。整理成时间线能直接渲染的形状。
+///
+/// 数据来自 `devices/android-*` 与 `devices/iphone-*` 里对应的事件；
+/// 没这些事件时（老版本客户端、或用户没授权）各项返回空数组，界面就是空。
+#[cfg_attr(not(beayy_mobile), tauri::command)]
+pub fn phone_extra_day(date: String) -> Value {
+    let Ok(date) = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") else { return Value::Null };
+    let (s, e) = day_bounds(date);
+    let (s, e) = (s.with_timezone(&Utc), e.with_timezone(&Utc));
+    let win = (s - Duration::minutes(10), e);
+    let pick = |types: &[&str]| -> Vec<Value> {
+        let mut v = device_events_any(&beayy_core::PHONE_PREFIXES, types, win.0, win.1);
+        v.sort_by(|a, b| a["timestamp"].as_str().cmp(&b["timestamp"].as_str()));
+        v
+    };
+    // 通知：谁发的、什么标题（正文默认没有）
+    let notifications: Vec<Value> = pick(&["notify.posted"])
+        .into_iter()
+        .map(|e| json!({
+            "at": e["timestamp"],
+            "app": e["app_name"].as_str().or(e["package_name"].as_str()).unwrap_or(""),
+            "title": e["title"].as_str().unwrap_or(""),
+            "text": e["text"].as_str().unwrap_or(""),
+        }))
+        .collect();
+    // 媒体：在听/在看什么
+    let media: Vec<Value> = pick(&["media.play"])
+        .into_iter()
+        .map(|e| json!({
+            "at": e["timestamp"],
+            "app": e["app_name"],
+            "title": e["title"].as_str().unwrap_or(""),
+            "artist": e["artist"].as_str().unwrap_or(""),
+            "state": e["state"].as_str().unwrap_or(""),
+        }))
+        .collect();
+    // 电量：只在充放电变化或跨 10% 时有记录，用来解释「怎么忽然没数据了」
+    let battery: Vec<Value> = pick(&["battery.state"])
+        .into_iter()
+        .map(|e| json!({
+            "at": e["timestamp"],
+            "percent": e["percent"],
+            "charging": e["charging"],
+            "plugged": e["plugged"].as_str().unwrap_or(""),
+        }))
+        .collect();
+    // 网络：断网是「同步失败／接口不通」的线索
+    let network: Vec<Value> = pick(&["network.state"])
+        .into_iter()
+        .map(|e| json!({
+            "at": e["timestamp"],
+            "type": e["type"].as_str().unwrap_or(""),
+            "online": e["online"],
+            "metered": e["metered"],
+        }))
+        .collect();
+    json!({
+        "date": date.to_string(),
+        "notifications": notifications,
+        "media": media,
+        "battery": battery,
+        "network": network,
+    })
 }

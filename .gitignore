@@ -2,3 +2,7 @@ target/
 .DS_Store
 Resources/AppIcon.iconset/
 .wrangler/
+android/.gradle/
+android/**/build/
+android/local.properties
+.pi/

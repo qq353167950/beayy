@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Beayy Android 的清单。
+
+  权限说明：
+  - BIND_ACCESSIBILITY_SERVICE：读界面文字、点击、打字。这是语义摘要的主料，用户必须在
+    「设置 → 无障碍」里手动启用。没有它应用照跑，只是采不到 ui.text。
+  - PACKAGE_USAGE_STATS：每个 app 的前台时长（UsageStatsManager）。同样需要用户手动授予。
+  - BIND_NOTIFICATION_LISTENER_SERVICE：谁发了什么通知（正文默认不记）。
+  - READ_PHONE_STATE：通话状态，可选。
+
+  所有采集都有开关，关掉后对应事件不再写入。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+：foregroundServiceType="dataSync" 必须单独申请这条，否则启动会崩 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 电池优化白名单：不申请的话 Doze 会冻结采集（跳转用 ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 使用情况访问：用户需在「设置 → 使用情况访问权限」里手动授予 -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 通话状态（可选） -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowBackup="false"
+        android:label="Beayy"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 无障碍服务：界面文字的来源。用户手动启用后系统才会绑上来 -->
+        <service
+            android:name=".CaptureAccessibility"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 前台 Service：保住采集进程。没有它，8.0+ 会冻结后台，心跳/使用情况就断了 -->
+        <service
+            android:name=".CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 通知监听：谁发了什么通知（正文默认不记） -->
+        <service
+            android:name=".NotifyListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 系统事件接收：电量、网络、屏幕、耳机、装卸 -->
+
+        <!-- 唤活：app 被杀/被划掉后，闹钟把前台服务拉起来 -->
+        <receiver
+            android:name=".ReviveReceiver"
+            android:exported="false" />
+
+        <!-- 开机自启：手机重启后接着记录。只监听解锁后的 BOOT_COMPLETED -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".SystemEvents"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BATTERY_CHANGED" />
+                <action android:name="android.intent.action.SCREEN_ON" />
+                <action android:name="android.intent.action.SCREEN_OFF" />
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.intent.action.HEADSET_PLUG" />
+                <action android:name="android.intent.action.PACKAGE_ADDED" />
+                <action android:name="android.intent.action.PACKAGE_REMOVED" />
+                <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
+                <action android:name="android.os.action.DEVICE_IDLE_MODE_CHANGED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  无障碍服务配置。
+
+  - accessibilityEventTypes 只要需要的几种：窗口变化、点击、滚动、文字变化。
+    不要 TYPE_ALL，那会把「每秒无数次」的事件全灌进来，耗电且没意义。
+  - canRetrieveWindowContent 必须为 true：界面文字就是从窗口树读的。
+  - flags：报告 view id（元素定位用）＋ 能读 WebView 内容（浏览器的文字才拿得到）。
+  - notificationTimeout 100ms：太短会丢字，太长会漏事件。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeViewClicked|typeViewScrolled|typeViewTextChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="100"
+    android:settingsActivity="app.beayy.android.MainActivity" />

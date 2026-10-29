@@ -105,6 +105,9 @@ pub struct Activity {
 
 pub struct Summarizer {
     pub root: PathBuf,
+    /// 用哪台设备的数据写摘要。桌面是 `local_device()`；手机另有身份（`androidapp-*`），
+    /// 但它采集的数据写在 `android-*` 下，所以要能指定。
+    pub device: Option<String>,
 }
 
 fn seg_start(name: &str) -> DateTime<Utc> {
@@ -214,7 +217,17 @@ fn py_round(x: f64) -> i64 {
 
 impl Summarizer {
     pub fn new(root: PathBuf) -> Self {
-        Summarizer { root }
+        Summarizer { root, device: None }
+    }
+
+    /// 指定用哪台设备的数据写摘要（手机端用：身份是 `androidapp-*`，数据写在本机 `android-*` 下）
+    pub fn with_device(root: PathBuf, device: impl Into<String>) -> Self {
+        Summarizer { root, device: Some(device.into()) }
+    }
+
+    /// 本机是哪台设备：指定过就用指定的，否则用 `local_device()`
+    fn own_device(&self) -> String {
+        self.device.clone().unwrap_or_else(beayy_core::local_device)
     }
 
     fn devices(&self) -> PathBuf {
@@ -278,7 +291,7 @@ impl Summarizer {
 
     /// 只读本机这台电脑的事件：写 10 分钟摘要用。同一个 10 分钟两台电脑都在用时，各写各的，时间线上分开显示
     fn load_own(&self, name: &str) -> Vec<Ev> {
-        let f = self.devices().join(beayy_core::local_device()).join("segments").join(name).join("events.jsonl");
+        let f = self.devices().join(self.own_device()).join("segments").join(name).join("events.jsonl");
         self.load_files(if f.is_file() { vec![f] } else { vec![] })
     }
 
@@ -607,12 +620,14 @@ impl Summarizer {
         (pack, apps, active)
     }
 
-    /// 某种设备（watch-、iphone-）在 [from, to] 这几个分段里的某类事件
-    fn device_events(&self, prefix: &str, ty_: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Ev> {
+    /// 某种设备在 [from, to] 这几个分段里的某类事件。`prefixes` 给一组前缀，任一个命中就算
+    /// （手机给 [beayy_core::PHONE_PREFIXES] 一次覆盖 iPhone 和 Android）
+    fn device_events_any(&self, prefixes: &[&str], ty_: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Ev> {
         let (lo, hi) = (beayy_core::segment_key(from), beayy_core::segment_key(to));
         let mut out = vec![];
         for dev in read_dir_sorted(&self.devices()) {
-            if !dev.file_name().map(|x| x.to_string_lossy().starts_with(prefix)).unwrap_or(false) {
+            let name = dev.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+            if !prefixes.iter().any(|p| name.starts_with(p)) {
                 continue;
             }
             for seg in read_dir_sorted(&dev.join("segments")) {
@@ -641,13 +656,12 @@ impl Summarizer {
         // 地点：同一个停留点取最后一版，和这 10 分钟有重叠的
         let mut visits: Vec<(DateTime<Utc>, Option<DateTime<Utc>>, String)> = vec![];
         let mut latest: HashMap<String, Ev> = HashMap::new();
-        // iPhone 和手表都可能记；手表的只在 iPhone 前后两天一条都没有时才用（以 iPhone 为准）
-        for prefix in ["iphone-", "watch-"] {
-            let have = !latest.is_empty();
-            for e in self.device_events(prefix, "place.visit", start - Duration::days(2), end) {
-                if prefix == "watch-" && have {
-                    break;
-                }
+        // 手机（iPhone／Android）和手表都可能记；手表的只在手机前后两天一条都没有时才用（以手机为准）
+        for e in self.device_events_any(&beayy_core::PHONE_PREFIXES, "place.visit", start - Duration::days(2), end) {
+            latest.insert(s(&e, "place_id").to_string(), e);
+        }
+        if latest.is_empty() {
+            for e in self.device_events_any(&[beayy_core::WATCH_PREFIX], "place.visit", start - Duration::days(2), end) {
                 latest.insert(s(&e, "place_id").to_string(), e);
             }
         }
@@ -669,7 +683,7 @@ impl Summarizer {
         // 对话：开口时刻在这 10 分钟里的
         let mut lines: Vec<(DateTime<Utc>, DateTime<Utc>, String, String)> = vec![];
         let mut seen = HashSet::new();
-        for e in self.device_events("watch-", "speech.utterance", start, end) {
+        for e in self.device_events_any(&[beayy_core::WATCH_PREFIX], "speech.utterance", start, end) {
             let Some(a) = t(e.get("start")).filter(|a| *a >= start && *a < end) else { continue };
             let z = t(e.get("end")).unwrap_or(a);
             let (who, text) = (s(&e, "speaker").to_string(), s(&e, "text").to_string());
@@ -716,7 +730,7 @@ impl Summarizer {
             return false;
         }
         let covered = self
-            .device_events("watch-", "speech.segment", now - Duration::hours(3), now)
+            .device_events_any(&[beayy_core::WATCH_PREFIX], "speech.segment", now - Duration::hours(3), now)
             .iter()
             .filter_map(|e| e.get("end").and_then(Value::as_str).and_then(|x| DateTime::parse_from_rfc3339(x).ok()))
             .map(|x| x.with_timezone(&Utc))
@@ -774,9 +788,9 @@ impl Summarizer {
             {"role": "system", "content": system}, {"role": "user", "content": user}]});
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)
-            .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+            .tls_config(tls_config())
             .timeout_global(Some(std::time::Duration::from_secs(120)))
-            // 出错时也读返回体：官方模型的没开通、额度用完写在里面
+            .tls_config(tls_config())
             .http_status_as_error(false)
             .build()
             .into();
@@ -948,7 +962,7 @@ impl Summarizer {
         }
         let names = self.segment_names();
         let now = Utc::now();
-        let mine = self.devices().join(beayy_core::local_device()).join("segments");
+        let mine = self.devices().join(self.own_device()).join("segments");
         let todo: Vec<String> = if pick.is_empty() {
             names
                 .iter()
@@ -1043,6 +1057,25 @@ pub const ACTIVITY_TREE: &[(&str, &[&str])] = &[
 pub const DOMAINS: &[&str] = &["工作", "成长", "生活", "健康", "关系", "休闲"];
 
 /// 二级类型 → 一级
+/// TLS 配置：桌面用系统根证书（macOS 钥匙串、Windows 证书库）；
+/// Android（feature rustls）用 rustls + ureq 自带的根证书，因为 NDK 没有系统 TLS 库。
+fn tls_config() -> ureq::tls::TlsConfig {
+    #[cfg(not(feature = "rustls"))]
+    {
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::NativeTls)
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build()
+    }
+    #[cfg(feature = "rustls")]
+    {
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::Rustls)
+            .root_certs(ureq::tls::RootCerts::WebPki)
+            .build()
+    }
+}
+
 pub fn activity_group(act: &str) -> &'static str {
     ACTIVITY_TREE.iter().find(|(g, xs)| xs.contains(&act) || *g == act).map(|(g, _)| *g).unwrap_or("其他")
 }
@@ -1101,10 +1134,11 @@ const ALIAS_PROMPT: &str = "下面是一个人最近用过的项目名（括号�
 const TAG_PROMPT: &str = "下面是用户电脑上一段 10 分钟活动的摘要。判断这段时间花在哪。只返回一个 JSON 对象，不要代码块，字段：
   parts: 0–3 个对象的数组，每个 {\"activity\": 二级类型, \"domain\": 领域, \"project\": 项目, \"share\": 占比 0–1}，占比加起来是 1；人不在电脑前（离开电脑、只有后台程序在跑）返回空数组 []
 ";
-
-/// 设备目录是不是电脑（mac-<主机名>、win-<计算机名>）；iPhone 的 iphone-* 不算，手机另算
+/// 设备目录是不是电脑（mac-<主机名>、win-<计算机名>）；手机（iphone-／android-）和手表不算。
+/// 判据只在 beayy_core 里有一份，这里转发——以前这里自己实现了一份 `mac-`/`win-` 的前缀判断，
+/// 加 Android 时两边容易改漏。
 pub fn is_computer(device: &str) -> bool {
-    device.starts_with("mac-") || device.starts_with("win-")
+    beayy_core::is_computer(device)
 }
 
 fn api_key() -> Result<String, String> {

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 无障碍服务在系统设置里显示给用户的说明。写清楚「记什么、不记什么」，这是透明性要求 -->
+    <string name="accessibility_description">Beayy 记录你在哪些 app 里做了什么，用来生成活动摘要。密码框的内容一律不记；可以指定某些 app 完全不记；随时可以暂停。</string>
+    <string name="app_name">Beayy</string>
+</resources>

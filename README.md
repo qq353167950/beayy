@@ -1,4 +1,6 @@
 # Beayy — Be Authentic. Your Yesterdays.
+> **来源说明：** 本项目是在 [`hengfengliya/beayy`](https://github.com/hengfengliya/beayy) 基础上修改和扩展的个人分支，包含 Android 客户端、跨平台界面及相关构建与同步改动。
+
 
 <p align="center">
 <a href="https://linux.do" alt="LINUX DO">

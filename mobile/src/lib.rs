@@ -18,8 +18,11 @@ mod sync;
 mod storage;
 #[path = "../../src-tauri/src/icons.rs"]
 mod icons;
+#[path = "../../src-tauri/src/daily.rs"]
+mod daily;
 
 use beayy_core::{data_root, default_root, EventLog};
+use chrono::Timelike;
 use beayy_remote::Relay;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -32,9 +35,11 @@ const CLOUD_EVERY: Duration = Duration::from_secs(120);
 
 static CLOUD: Mutex<String> = Mutex::new(String::new());
 static START: Once = Once::new();
-
-/// 这台手机在同步里的设备名：iosapp-<8 位十六进制>，第一次启动生成存在数据目录。
-/// 不能和电脑那边的 iphone-…（屏幕使用、停留点）同名，否则同步会以为那是本机的、不下载
+static CAPTURE_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 这台手机在同步里的设备名：iPhone 是 iosapp-<8 位十六进制>，Android 是 androidapp-<8 位十六进制>，
+/// 第一次启动生成存在数据目录。
+/// 不能和电脑那边的 iphone-…／android-…（屏幕使用、停留点）同名，否则同步会以为那是本机的、不下载。
+/// 前缀带 app 后缀就是为了和「手机自己记的数据」区分开：数据仓库认的是 android-／iphone-，这里只是一台客户端的身份。
 fn device_id() -> String {
     let f = default_root().join("mobile_device");
     if let Ok(s) = std::fs::read_to_string(&f) {
@@ -42,8 +47,9 @@ fn device_id() -> String {
             return s.trim().to_string();
         }
     }
+    let prefix = if cfg!(target_os = "android") { "androidapp" } else { "iosapp" };
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let id = format!("iosapp-{:08x}", (t.subsec_nanos() ^ t.as_secs() as u32).wrapping_mul(2654435761));
+    let id = format!("{prefix}-{:08x}", (t.subsec_nanos() ^ t.as_secs() as u32).wrapping_mul(2654435761));
     let _ = std::fs::create_dir_all(default_root());
     let _ = std::fs::write(&f, &id);
     id
@@ -62,25 +68,33 @@ fn web_log(text: &str) {
 /// 手机版的状态：没有采集、没有权限，只有同步和录音的进度
 fn get_status() -> Value {
     json!({
-        "mobile": true, "capturing": false, "paused": false, "permissions": {}, "events_today": 0,
+        "mobile": true, "capturing": true, "paused": false, "permissions": {}, "events_today": 0,
         "device": beayy_core::local_device(), "version": env!("CARGO_PKG_VERSION"),
         "cloud_sync": CLOUD.lock().unwrap().clone(), "relay_sync": "", "login_item": false,
     })
 }
 
-/// 启动后台：账号同步（只下载）、录音和停留点。只跑一次
+/// 启动 Android 本地采集、账号同步和摘要任务。采集始终本地运行，不依赖账号登录。
 fn start() {
     START.call_once(|| {
         std::env::set_var("BEAYY_DEVICE", device_id());
         let root = data_root();
-        // 同步日志不放进 devices/：手机不是一台采集设备，放进去设备页会把它当「这台」、去查电脑那些权限
         let _ = std::fs::remove_dir_all(root.join("devices").join(beayy_core::local_device()));
+        #[cfg(target_os = "android")]
+        {
+            beayy_capture::android::start(Arc::new(EventLog::new(
+                root.clone(),
+                format!("android-{}", device_id().trim_start_matches("androidapp-")),
+            )));
+            CAPTURE_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         sync::start(Arc::new(EventLog::new(root.join("mobile"), beayy_core::local_device())));
+        let relay_root = root.clone();
         std::thread::spawn(move || {
             let mut relay = Relay::default();
             relay.device_suffix = "-m".into();
             loop {
-                let msg = match beayy_remote::cloud::round(&mut relay, &root, Duration::from_secs(90)) {
+                let msg = match beayy_remote::cloud::round(&mut relay, &relay_root, Duration::from_secs(90)) {
                     Ok(n) => n.summary(),
                     Err(e) => e,
                 };
@@ -88,7 +102,34 @@ fn start() {
                 std::thread::sleep(CLOUD_EVERY);
             }
         });
+        let summary_root = root.clone();
+        std::thread::spawn(move || loop {
+            let now = chrono::Utc::now();
+            let wait = (60 * (10 - (now.minute() + 9) % 10)) as i64 - now.second() as i64;
+            std::thread::sleep(Duration::from_secs(wait.max(30) as u64));
+            run_summary(&summary_root);
+        });
     });
+}
+
+
+/// 跑一次摘要（手机端）。数据在本机 `android-*` 目录下，摘要写进 `<数据根>/summaries/`。
+/// 没配模型就什么都不做——`Summarizer::run` 自己会失败退避，这里不需要额外判断。
+fn run_summary(root: &std::path::Path) {
+    // 采集设备名：手机自己采集的数据写在这个前缀下（见 beayy-capture 的 android 模块）
+    let dev = format!("android-{}", device_id().trim_start_matches("androidapp-"));
+    let sm = beayy_summary::Summarizer::with_device(root.to_path_buf(), dev);
+    let mut log = |line: String| {
+        let dir = root.join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("summarizer.log")) {
+            use std::io::Write;
+            let _ = writeln!(f, "{} {line}", chrono::Utc::now().to_rfc3339());
+        }
+    };
+    sm.run(&[], &mut log);
+    sm.update_aliases(&mut log);
+    sm.rollups(&mut log);
 }
 
 // ---------- 网页的命令 ----------
@@ -118,6 +159,14 @@ fn dispatch(cmd: &str, a: &Map<String, Value>) -> Result<Value, String> {
         "save_settings" => ok(data::save_settings(arg(a, "settings")?)?),
         "storage_stats" => ok(wait(storage::storage_stats())),
         "llm_status" => ok(wait(data::llm_status())),
+        "set_api_key" => ok(data::set_api_key(arg(a, "key")?)?),
+        "daily_status" => ok(daily::daily_status(arg(a, "date")?)),
+        "get_week" => ok(daily::get_week(arg(a, "date")?)?),
+        "generate_daily" => ok(wait(daily::generate_daily(arg(a, "date")?))?),
+        "generate_weekly" => ok(wait(daily::generate_weekly(arg(a, "date")?))?),
+        "model_ready" => ok(data::model_ready()),
+        "run_summary_once" => { run_summary(&data_root()); ok(()) }
+        "phone_extra_day" => ok(data::phone_extra_day(arg(a, "date")?)),
         "test_model" => ok(wait(data::test_model())?),
         "delete_since" => ok(data::delete_since(arg(a, "minutes")?, arg(a, "today")?)?),
         "list_devices" => ok(data::list_devices()),
@@ -156,6 +205,18 @@ fn dispatch(cmd: &str, a: &Map<String, Value>) -> Result<Value, String> {
     }
 }
 
+
+/// C／JNI 共用的入口：把 JSON 文本拆开，调 dispatch，包成 `{"ok":…}` 或 `{"err":"…"}`。
+/// iOS 的 `beayy_call` 和 Android 的 JNI `call` 都走这里，两边行为一致。
+pub fn beayy_dispatch(cmd: &str, args_json: &str) -> String {
+    let a: Map<String, Value> = serde_json::from_str(args_json).unwrap_or_default();
+    let out = match std::panic::catch_unwind(|| dispatch(cmd, &a)) {
+        Ok(Ok(v)) => json!({ "ok": v }),
+        Ok(Err(e)) => json!({ "err": e }),
+        Err(_) => json!({ "err": format!("{cmd} 出错了") }),
+    };
+    out.to_string()
+}
 /// 网页调一个命令：cmd 是命令名，args 是 JSON 对象；返回 `{"ok": 结果}` 或 `{"err": "…"}`（用 beayy_free 释放）。
 /// 会阻塞（联网的命令要几秒），Swift 在后台队列里调
 ///
@@ -188,5 +249,118 @@ pub extern "C" fn beayy_start() {
 pub unsafe extern "C" fn beayy_free(p: *mut c_char) {
     if !p.is_null() {
         drop(CString::from_raw(p));
+    }
+}
+
+// ---------- JNI 入口（只有 Android 需要） ----------
+//
+// Kotlin 的 `BeayyBridge` 声明了三个 external 方法。JNI 要求符号名严格是
+// `Java_<包名下划线化>_<类名>_<方法名>`，所以这里必须单独导出——上面那些
+// `beayy_call`／`beayy_start` 是给 iOS 的 C 接口用的，Kotlin 认不到。
+//
+// 签名对应 `BeayyBridge.kt`：
+//   private external fun call(cmd: String, argsJson: String): String
+//   private external fun startCapture()
+//   private external fun capture(op: String, argsJson: String): String
+#[cfg(target_os = "android")]
+pub mod jni_bridge {
+    use super::*;
+    use jni::objects::{JClass, JString};
+    use jni::sys::jstring;
+    use jni::JNIEnv;
+
+    /// 把 Java String 读成 Rust String（null 当空串）
+    fn jstr(env: &mut JNIEnv, s: &JString) -> String {
+        if s.is_null() {
+            return String::new();
+        }
+        env.get_string(s).map(|x| x.into()).unwrap_or_default()
+    }
+
+    /// 返回给 Java 的字符串；出异常时给个能看懂的 JSON，别抛到 Kotlin 那边崩掉
+    fn to_jstring(env: &mut JNIEnv, s: String) -> jstring {
+        match env.new_string(s) {
+            Ok(o) => o.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// 跨 JNI 边界的 panic 兜底：Rust panic 穿过 FFI 是未定义行为（进程直接死），
+    /// 必须在边界 catch_unwind，转成错误文本。
+    fn guard<R>(f: impl FnOnce() -> R, what: &str) -> Result<R, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .map_err(|e| match e.downcast_ref::<&str>() {
+                Some(s) => format!("{what}: {s}"),
+                None => match e.downcast_ref::<String>() {
+                    Some(s) => format!("{what}: {s}"),
+                    None => format!("{what}: panic"),
+                },
+            })
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_app_beayy_android_BeayyBridge_jniCall(
+        mut env: JNIEnv,
+        _class: JClass,
+        cmd: JString,
+        args: JString,
+    ) -> jstring {
+        let c = jstr(&mut env, &cmd);
+        let a = jstr(&mut env, &args);
+        let out = match guard(|| beayy_dispatch(&c, &a), "call") {
+            Ok(s) => s,
+            Err(e) => serde_json::json!({"err": e}).to_string(),
+        };
+        to_jstring(&mut env, out)
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_app_beayy_android_BeayyBridge_jniStart(_env: JNIEnv, _class: JClass) {
+        let _ = guard(start, "start");
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_app_beayy_android_BeayyBridge_setAndroidHome(
+        mut env: JNIEnv,
+        _class: JClass,
+        path: JString,
+    ) {
+        let p = jstr(&mut env, &path);
+        if !p.is_empty() {
+            std::env::set_var("BEAYY_ANDROID_HOME", &p);
+            std::fs::create_dir_all(&p).ok();
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_app_beayy_android_BeayyBridge_setDataRoot(
+        mut env: JNIEnv,
+        _class: JClass,
+        path: JString,
+    ) {
+        let p = jstr(&mut env, &path);
+        if !p.is_empty() {
+            std::env::set_var("BEAYY_DATA_ROOT", &p);
+            std::fs::create_dir_all(&p).ok();
+        }
+    }
+
+    /// 采集事件：调 `beayy_capture::android::dispatch`。
+    /// 采集还没启动时返回一句错误，Kotlin 侧只打日志，不抛。
+    #[no_mangle]
+    pub extern "system" fn Java_app_beayy_android_BeayyBridge_jniCapture(
+        mut env: JNIEnv,
+        _class: JClass,
+        op: JString,
+        args: JString,
+    ) -> jstring {
+        let o = jstr(&mut env, &op);
+        let a = jstr(&mut env, &args);
+        let v: serde_json::Value = serde_json::from_str(&a).unwrap_or(serde_json::Value::Null);
+        let out = match beayy_capture::android::dispatch(&o, &v) {
+            Ok(()) => "{\"ok\":true}".to_string(),
+            Err(e) => serde_json::json!({"err": e}).to_string(),
+        };
+        to_jstring(&mut env, out)
     }
 }

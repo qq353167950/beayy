@@ -84,7 +84,7 @@ fn advance(st: &mut Map<String, Value>, prefix: &str, items: &[Value], miss: Opt
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .proxy(None)
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(crate::tls_config())
         .timeout_global(Some(Duration::from_secs(120)))
         .http_status_as_error(false)
         .build()
@@ -305,6 +305,60 @@ fn push_config(root: &Path, st: &mut Map<String, Value>) -> Result<(), String> {
     st.insert("config_sig".into(), json!(sig));
     write_state(root, st);
     Ok(())
+}
+
+// ---------- 模型配置的跨设备同步（account/model.json） ----------
+//
+// 只同步「网关地址 + 模型名 + 模式 + 时间戳」，**密钥永远不上传**（见 beayy_core::model_config 的模块说明）。
+// 合并规则：谁的 updated 新用谁的；本机新就推上去，远端新就落地。两边一样新不动。
+
+/// 本机设置里的模型配置
+fn local_model(root: &Path) -> beayy_core::model_config::ModelProfile {
+    let p = root.join("settings.json");
+    let s: Map<String, Value> = std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    beayy_core::model_config::ModelProfile::from_settings(&s)
+}
+
+/// 把合并后的配置写回本机 settings.json（只动模型那几个键）
+fn write_local_model(root: &Path, p: &beayy_core::model_config::ModelProfile) -> Result<(), String> {
+    let path = root.join("settings.json");
+    let mut s: Map<String, Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    p.write_into(&mut s);
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let tmp = root.join("settings.json.tmp");
+    let body = serde_json::to_vec_pretty(&Value::Object(s)).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+/// 拉一次远端的模型配置，和本机比新旧，必要时落地或回推。返回一句给界面看的话。
+pub fn sync_model_profile(root: &Path) -> Result<String, String> {
+    if beayy_sync::load(root).is_none() {
+        return Ok(String::new()); // 没登录就不同步，也不算错
+    }
+    let local = local_model(root);
+    let remote = match beayy_sync::get_named(root, "account", beayy_core::model_config::SYNC_BLOCK)? {
+        Some(b) => beayy_core::model_config::ModelProfile::from_bytes(&b),
+        None => None,
+    };
+    let Some(remote) = remote else {
+        // 服务器上还没有：本机配过就推上去（updated=0 说明从没动过，不推空配置）
+        if local.updated > 0 {
+            beayy_sync::put_named(root, "account", beayy_core::model_config::SYNC_BLOCK, &local.to_bytes())?;
+            return Ok("已把本机模型配置传上去".into());
+        }
+        return Ok(String::new());
+    };
+    let (won, push) = beayy_core::model_config::ModelProfile::merge(&local, &remote);
+    if push {
+        beayy_sync::put_named(root, "account", beayy_core::model_config::SYNC_BLOCK, &won.to_bytes())?;
+        Ok("已把本机模型配置传上去".into())
+    } else if won != local {
+        write_local_model(root, &won)?;
+        Ok("已同步别的设备的模型配置".into())
+    } else {
+        Ok(String::new())
+    }
 }
 
 /// 手机：取电脑推的配置，高德 Key 存进本机（地名、候选用），转写服务地址写进设置

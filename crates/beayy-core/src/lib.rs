@@ -4,6 +4,8 @@
 //! `<数据根>/devices/<设备>/segments/<UTC 整 10 分>/events.jsonl`，每行一个 JSON，键按字母排序，
 //! 每条带 `event_type`、`timestamp`（UTC，ISO8601 毫秒，带 Z）、`device`。只追加，不改写。
 
+pub mod model_config;
+
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::{Map, Value};
 use std::fs::{self, File, OpenOptions};
@@ -46,15 +48,27 @@ pub const DEFAULT_TRANSCRIBE: &str = match option_env!("BEAYY_DEFAULT_TRANSCRIBE
 
 /// 正式数据根（不管影子模式），读 iPhone 对数、读摘要时用
 pub fn default_root() -> PathBuf {
-    #[cfg(target_os = "windows")]
+    // Android：没有 HOME，也没有 Library 概念。应用私有目录由外壳（JNI）在启动时
+    // 写进 BEAYY_ANDROID_HOME（MainActivity 里 app.filesDir），这里只做兜底。
+    #[cfg(target_os = "android")]
     {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-        PathBuf::from(appdata).join("Beayy")
+        if let Ok(home) = std::env::var("BEAYY_ANDROID_HOME") {
+            return PathBuf::from(home);
+        }
+        PathBuf::from("/data/local/tmp/beayy")
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(target_os = "android"))]
     {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join("Library/Application Support/Beayy")
+        #[cfg(target_os = "windows")]
+        {
+            let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+            PathBuf::from(appdata).join("Beayy")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join("Library/Application Support/Beayy")
+        }
     }
 }
 
@@ -122,6 +136,43 @@ pub fn local_device() -> String {
         "other-unknown".into()
     }
 }
+// ---------- 设备家族 ----------
+
+/// 手机（iPhone／Android）的设备目录名前缀。手机记录的数据（屏幕使用 app.focus、停留点 place.visit、
+/// 对话转写 speech.*）都写在 `devices/<前缀>-<id>/` 下，和电脑（mac-、win-）分开算。
+pub const PHONE_PREFIXES: [&str; 2] = ["iphone-", "android-"];
+/// 手表的设备目录名前缀（录音转写写在 `devices/watch-<id>/`）
+pub const WATCH_PREFIX: &str = "watch-";
+
+/// 是不是手机（iPhone 或 Android）。数据来自手机、不算电脑，展示时并入「手机」那一栏。
+///
+/// 以前各处写死 `starts_with("iphone-")`，加 Android 时会漏掉一部分（同步不传、展示不认），
+/// 所以判据只留这一份，其它地方一律调它。
+pub fn is_phone(device: &str) -> bool {
+    PHONE_PREFIXES.iter().any(|p| device.starts_with(p))
+}
+
+/// 是不是手表
+pub fn is_watch(device: &str) -> bool {
+    device.starts_with(WATCH_PREFIX)
+}
+
+/// 是不是电脑（mac-<主机名>、win-<计算机名>）。手机、手表都不算。
+pub fn is_computer(device: &str) -> bool {
+    !is_phone(device) && !is_watch(device)
+}
+
+/// 设备归类，给存储统计这类「按种类合计」的地方用：computer／phone／watch
+pub fn device_kind(device: &str) -> &'static str {
+    if is_watch(device) {
+        "watch"
+    } else if is_phone(device) {
+        "phone"
+    } else {
+        "computer"
+    }
+}
+
 
 /// UTC ISO8601，毫秒，带 Z。毫秒四舍五入（和 Swift 版 ISO8601DateFormatter 一致；直接格式化是截断）
 pub fn iso(t: DateTime<Utc>) -> String {
@@ -202,6 +253,33 @@ macro_rules! fields {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+
+    #[test]
+    fn device_family() {
+        // 手机：iPhone 和 Android 都算，都并入「手机」那一栏
+        assert!(is_phone("iphone-1a2b3c4d"));
+        assert!(is_phone("android-5e6f7a8b"));
+        assert!(!is_phone("mac-mymac"));
+        assert!(!is_phone("win-pc"));
+        assert!(!is_phone("watch-1a2b3c4d"));
+
+        assert!(is_watch("watch-1a2b3c4d"));
+        assert!(!is_watch("android-5e6f7a8b"));
+
+        // 电脑：只有 mac-、win- 这类，手机手表都不算（「今天」里手机单独统计）
+        assert!(is_computer("mac-mymac"));
+        assert!(is_computer("win-pc"));
+        assert!(!is_computer("iphone-1a2b3c4d"));
+        assert!(!is_computer("android-5e6f7a8b"));
+        assert!(!is_computer("watch-1a2b3c4d"));
+
+        assert_eq!(device_kind("android-5e6f7a8b"), "phone");
+        assert_eq!(device_kind("iphone-1a2b3c4d"), "phone");
+        assert_eq!(device_kind("watch-1a2b3c4d"), "watch");
+        assert_eq!(device_kind("mac-mymac"), "computer");
+        assert_eq!(device_kind("win-pc"), "computer");
+    }
 
     #[test]
     fn segment_and_iso() {

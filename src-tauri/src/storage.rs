@@ -18,7 +18,7 @@ fn local(root: &Path) -> Value {
     let mut cats: BTreeMap<&str, u64> = BTreeMap::new();
     for e in std::fs::read_dir(root.join("devices")).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()).unwrap_or_default() {
         let n = e.file_name().to_string_lossy().to_string();
-        let k = if n.starts_with("watch-") { "watch" } else if n.starts_with("iphone-") { "phone" } else { "computer" };
+        let k = beayy_core::device_kind(&n);
         *cats.entry(k).or_default() += dir_size(&e.path());
     }
     let total = dir_size(root);

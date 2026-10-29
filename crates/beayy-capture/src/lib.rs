@@ -7,6 +7,8 @@ mod common;
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "android")]
+pub mod android;
 
 #[cfg(target_os = "macos")]
 use macos as platform_impl;
@@ -14,6 +16,8 @@ use macos as platform_impl;
 use windows as platform_impl;
 
 /// 权限状态。Windows 上没有这些系统授权，一律视为已授权。
+/// Android 的授权（无障碍、使用情况访问、通知使用权）由 Kotlin 侧管，
+/// 状态也由 `MainActivity` 查；这里不下判断，交给平台。
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PermissionStatus {
     pub accessibility: bool,
@@ -21,13 +25,50 @@ pub struct PermissionStatus {
     pub full_disk_access: bool,
 }
 
+/// Android 上「无障碍服务连没连上」由 Kotlin 侧用 JNI 告诉我们：
+/// Rust 这边读不到系统服务状态，所以用一个可写的开关，由 `beayy-capture::android` 更新。
+#[cfg(target_os = "android")]
+mod android_perms {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    pub static ACCESSIBILITY: AtomicBool = AtomicBool::new(false);
+    pub fn set_accessibility(on: bool) {
+        ACCESSIBILITY.store(on, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "android")]
+pub use android_perms::set_accessibility;
+
 pub fn permissions() -> PermissionStatus {
-    platform_impl::permissions()
+    #[cfg(target_os = "android")]
+    {
+        PermissionStatus {
+            accessibility: android_perms::ACCESSIBILITY.load(std::sync::atomic::Ordering::Relaxed),
+            // Android 没有「输入监控」这个授权概念：无障碍本身就能读到输入
+            input_monitoring: true,
+            // 也没有「完全磁盘访问」：应用自带私有目录
+            full_disk_access: true,
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        platform_impl::permissions()
+    }
 }
 
 /// 打开系统设置里对应的授权页：accessibility／input_monitoring／full_disk_access
+///
+/// Android 上跳转由 Kotlin 的 `MainActivity` 负责（`openSettings` 那排按钮），
+/// Rust 这边没有 Context，跳不了，静默忽略。
 pub fn open_permission(kind: &str) {
-    platform_impl::open_permission(kind)
+    #[cfg(target_os = "android")]
+    {
+        let _ = kind;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        platform_impl::open_permission(kind)
+    }
 }
 
 pub fn platform() -> &'static str {
@@ -35,7 +76,10 @@ pub fn platform() -> &'static str {
         "macos"
     } else if cfg!(target_os = "windows") {
         "windows"
+    } else if cfg!(target_os = "android") {
+        "android"
     } else {
         "other"
     }
 }
+

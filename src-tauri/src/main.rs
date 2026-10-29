@@ -150,12 +150,30 @@ fn dev_report(name: String, text: String) {
 
 #[tauri::command]
 fn open_permission(kind: String) {
-    // 屏幕使用时间（iCloud 跨设备共享）不是权限，但也在系统设置里：「怎么设置」弹层用
+    // 屏幕使用时间（iCloud 跨设备共享）只存在于 macOS。
     if kind == "screentime" {
-        let _ = std::process::Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.Screen-Time-Settings.extension").spawn();
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.Screen-Time-Settings.extension").spawn();
+        }
         return;
     }
     beayy_capture::open_permission(&kind);
+}
+#[tauri::command]
+fn open_data_dir() {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer.exe").arg(data_root()).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/open").arg(data_root()).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(data_root()).spawn();
+    }
 }
 
 /// 「现在读取」：iPhone 屏幕使用时间不等 5 分钟，马上读一次
@@ -166,10 +184,6 @@ fn phone_read_now() {
     PHONE_NOW.store(true, Ordering::Relaxed);
 }
 
-#[tauri::command]
-fn open_data_dir() {
-    let _ = std::process::Command::new("/usr/bin/open").arg(data_root()).spawn();
-}
 
 fn open_main(app: &AppHandle) {
     // 主窗口开着时进 Dock、能 ⌘Tab；关掉后退回只在菜单栏（见 run 里的 Destroyed）
@@ -389,7 +403,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status, phone_read_now, set_paused, set_login_item, quit_app, open_permission, open_data_dir, dev_report,
             data::list_days, data::get_day, data::get_rules, data::save_rules,
-            data::get_settings, data::save_settings, storage::storage_stats, data::llm_status, data::set_api_key, data::set_relay_token, data::delete_since, data::list_devices, data::rename_device, data::set_place_label, data::recent_events, data::set_place_pick, data::clear_place_pick, data::list_place_labels, data::place_stats, data::edit_place_label, amap::set_amap_key, amap::amap_around, amap::amap_search, amap::amap_map, amap::amap_js_config, amap::set_amap_js, icons::get_icons, daily::generate_daily, daily::daily_status, daily::get_week, daily::generate_weekly, data::test_model,
+            data::get_settings, data::save_settings, storage::storage_stats, data::llm_status, data::model_ready, data::phone_extra_day, data::set_api_key, data::set_relay_token, data::delete_since, data::list_devices, data::rename_device, data::set_place_label, data::recent_events, data::set_place_pick, data::clear_place_pick, data::list_place_labels, data::place_stats, data::edit_place_label, amap::set_amap_key, amap::amap_around, amap::amap_search, amap::amap_map, amap::amap_js_config, amap::set_amap_js, icons::get_icons, daily::generate_daily, daily::daily_status, daily::get_week, daily::generate_weekly, data::test_model,
             data::get_profile, data::save_profile, data::list_projects, data::merge_project, data::set_project_domain,
             sync::sync_status, sync::sync_now,
             sync::account_signup, sync::account_login, sync::account_claim, sync::account_recover, sync::account_password,

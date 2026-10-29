@@ -4,19 +4,33 @@ description = "Beayy 手机版的 Rust 核心（iOS 静态库）：和电脑同�
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+[features]
+# iOS 走系统 TLS；Android 构建时用 --no-default-features --features rustls
+default = ["native-tls"]
+native-tls = ["ureq/native-tls", "beayy-sync/native-tls", "beayy-remote/native-tls"]
+rustls = ["ureq/rustls", "beayy-sync/rustls", "beayy-remote/rustls"]
 
 [lib]
 name = "beayy_mobile"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-beayy-core.workspace = true
-beayy-summary.workspace = true
-beayy-sync.workspace = true
-beayy-remote.workspace = true
+# 子 crate 一律写路径 + default-features = false：TLS 后端由本 crate 的 feature 决定（见上）。
+# 不关的话，`cargo build --no-default-features --features rustls` 只作用于本包，
+# 子 crate 仍会默认拉进 native-tls → openssl-sys，Android 上直接编不过。
+# （用 workspace = true 的话 Cargo 会忽略这里的 default-features：要 2024 edition 才允许覆盖。）
+beayy-core = { path = "../crates/beayy-core" }
+beayy-summary = { path = "../crates/beayy-summary", default-features = false }
+beayy-sync = { path = "../crates/beayy-sync", default-features = false }
+beayy-remote = { path = "../crates/beayy-remote", default-features = false }
 regex = "1"
-ureq = { version = "3", default-features = false, features = ["json", "native-tls"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
 pollster = "0.4"
+# 采集：Android 的无障碍事件走 beayy-capture 的 android 模块（判断与落盘都在那边）。
+# 这个 crate 在非 Android 目标下没有对应模块，所以只在 Android 上引入。
+[target.'cfg(target_os = "android")'.dependencies]
+beayy-capture = { path = "../crates/beayy-capture" }
+jni = "0.21"

@@ -5,6 +5,9 @@
 
 const $app = document.getElementById("app");
 const TAURI = window.__TAURI__ && window.__TAURI__.core;
+// Android：外壳往 WebView 里注入了 AndroidBridge（Kotlin 转发 Rust 的 dispatch）。
+// 接口约定和 Tauri 同一套：命令名相同、args 相同、返回 {ok}/{err} 的 JSON 文本。
+const ANDROID = window.AndroidBridge && typeof window.AndroidBridge.bridge === "function";
 // 手机版没有开发者工具：网页报错交给外壳记进日志（电脑版没有这个命令，调用失败就算了）
 if (TAURI) {
   const report = (t) => { try { TAURI.invoke("web_log", { text: t }).catch(() => {}); } catch (e) {} };
@@ -37,7 +40,16 @@ async function loadMock(name) {
 
 async function call(cmd, args = {}) {
   if (TAURI) return TAURI.invoke(cmd, args);
-  // 浏览器里：写操作只改内存，读操作读样例
+  // Android：Kotlin 桥是同步的，返回 JSON 文本；包一层 Promise 还原 Tauri 语义
+  if (ANDROID) {
+    return new Promise((resolve, reject) => {
+      try {
+        const out = JSON.parse(window.AndroidBridge.bridge(cmd, JSON.stringify(args)));
+        if (out && out.ok !== undefined) resolve(out.ok);
+        else reject(new Error(out && out.err ? out.err : "命令失败"));
+      } catch (e) { reject(e); }
+    });
+  }
   switch (cmd) {
     case "save_rules": mockState.rules = args.rules; return null;
     case "save_settings": mockState.settings = { ...(mockState.settings || await loadMock("get_settings")), ...args.settings }; return null;
@@ -50,6 +62,8 @@ async function call(cmd, args = {}) {
       if (mockState.hasKey) s.has_api_key = true;
       return s;
     }
+    case "model_ready": return { ready: true, missing: [], mode: "official", message: "" };
+    case "llm_status": return { local: { mode: "official", ready: true, missing: [] }, quota: { plan: null } };
     case "get_status": {
       const s = await loadMock("get_status");
       if (mockState.paused !== undefined) s.paused = mockState.paused;
@@ -109,6 +123,17 @@ const ICON = {
   close: '<svg class="mx-ico" viewBox="0 0 16 16"><path d="m4.5 4.5 7 7M11.5 4.5l-7 7"/></svg>',
   more: '<svg class="mx-ico" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r="1" fill="currentColor" stroke="none"/><circle cx="12.5" cy="8" r="1" fill="currentColor" stroke="none"/></svg>',
 };
+const ANDROID_SETTING_ICONS = {
+  accessibility: '<svg class="mx-ico lu" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><path d="M5 9h14M12 9v11M8 20l4-6 4 6"/></svg>',
+  usage: '<svg class="mx-ico lu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 16v-5M12 16V8M16 16v-2"/></svg>',
+  notifications: '<svg class="mx-ico lu" viewBox="0 0 24 24"><path d="M6 10a6 6 0 0 1 12 0c0 5 2 5 2 7H4c0-2 2-2 2-7M10 20h4"/></svg>',
+  battery: '<svg class="mx-ico lu" viewBox="0 0 24 24"><rect x="3" y="7" width="16" height="10" rx="2"/><path d="M21 10v4M7 10v4M10 10v4"/></svg>',
+  auto_start: '<svg class="mx-ico lu" viewBox="0 0 24 24"><path d="M12 3v10M8 6a8 8 0 1 0 8 0"/></svg>',
+  hide_ongoing: '<svg class="mx-ico lu" viewBox="0 0 24 24"><path d="M4 7h16M6 7l1 13h10l1-13M9 7V4h6v3M9 11v5M15 11v5"/></svg>',
+  hide_recents: '<svg class="mx-ico lu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h5M8 17h8"/></svg>',
+  keep_alive: '<svg class="mx-ico lu" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/><circle cx="12" cy="12" r="3"/></svg>',
+};
+const androidSettingLabel = (key, name) => `<span class="android-setting-label"><span class="android-setting-icon" aria-hidden="true">${ANDROID_SETTING_ICONS[key] || ""}</span><span>${esc(name)}</span></span>`;
 
 // 极简 Markdown：小标题、列表、段落，行内粗体和代码。先转义再加标记。
 function md(text) {
@@ -145,6 +170,88 @@ function splitSummary(text) {
 function header(title, right = "") {
   return `<header class="mx-head"><div class="mx-head-row" data-tauri-drag-region><h1 class="mx-title">${esc(title)}</h1><div class="mx-head-right">${right}</div></div></header>`;
 }
+
+/**
+ * 手机独有的信号：通知、媒体播放、电量、网络。
+ *
+ * 这些是 Android 才采得到的事件（桌面和 iOS 没有），以前只存在数据里、界面上看不见。
+ * 只在「手机」页签下显示；没有数据时返回空串，不占位置。
+ */
+function phoneExtraBlock(x) {
+  if (!x || typeof x !== "object") return "";
+  const notif = Array.isArray(x.notifications) ? x.notifications : [];
+  const media = Array.isArray(x.media) ? x.media : [];
+  const battery = Array.isArray(x.battery) ? x.battery : [];
+  const net = Array.isArray(x.network) ? x.network : [];
+  if (!notif.length && !media.length && !battery.length && !net.length) return "";
+  const hhmm = (t) => { const d = new Date(t); return isNaN(d) ? "" : `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+  const blocks = [];
+  if (notif.length) {
+    const rows = notif.slice(-20).reverse().map((n) =>
+      `<li><span class="mono">${hhmm(n.at)}</span> ${esc(n.app)}${n.title ? ` · ${esc(n.title)}` : ""}</li>`).join("");
+    blocks.push(section("谁来找过你", `<ul class="pe-list">${rows}</ul>`, { count: notif.length }));
+  }
+  if (media.length) {
+    const rows = media.slice(-20).reverse().map((m) =>
+      `<li><span class="mono">${hhmm(m.at)}</span> ${esc(m.app)}${m.title ? ` · ${esc(m.title)}` : ""}${m.artist ? ` <span class="note">${esc(m.artist)}</span>` : ""}</li>`).join("");
+    blocks.push(section("在听/在看", `<ul class="pe-list">${rows}</ul>`, { count: media.length }));
+  }
+  if (battery.length) {
+    const seen = new Set();
+    const rows = battery.filter((b) => {
+      const k = `${b.charging}|${Math.floor((b.percent || 0) / 20)}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    }).slice(-10).map((b) =>
+      `<li><span class="mono">${hhmm(b.at)}</span> ${b.percent == null ? "?" : b.percent}% ${b.charging ? "充电中" : "用电中"}${b.plugged ? ` <span class="note">${esc(b.plugged)}</span>` : ""}</li>`).join("");
+    blocks.push(section("电量", `<ul class="pe-list">${rows}</ul>`));
+  }
+  if (net.length) {
+    const rows = net.slice(-10).map((n) =>
+      `<li><span class="mono">${hhmm(n.at)}</span> ${esc(n.type || "未知")}${n.online === false ? " · 没网" : ""}</li>`).join("");
+    blocks.push(section("网络", `<ul class="pe-list">${rows}</ul>`));
+  }
+  return blocks.length ? `<div class="pe-extra">${blocks.join("")}</div>` : "";
+}
+
+/**
+ * 模型配置的同步说明：网关和模型名会跟着账号走（密钥不会），新设备登录后自动带上。
+ * 从别的设备同步下来但本机还没填密钥时，要明确说一句——不然用户不知道摘要为什么还是不出。
+ */
+function modelSyncHint(cf) {
+  const synced = S.sync && S.sync.configured;
+  if (!synced) return "";
+  if (!cf.has_api_key) return `<br><span class="note">配置已从账号同步下来，但这台设备还没有密钥——摘要不会生成，点右边「设置」补上。</span>`;
+  return `<br><span class="note">网关和模型名与账号同步（密钥只存本机）</span>`;
+}
+
+function modelBanner() {
+  const m = S.modelReady || { ready: true, message: "" };
+  if (S.bannerOff || m.ready) return "";
+  const msg = m.message || "还没配置模型，不会生成摘要。";
+  return `<div class="model-banner" role="alert">
+    <span class="model-banner-text">${esc(msg)}</span>
+    <button type="button" class="model-banner-go" id="model-banner-go">去设置</button>
+    <button type="button" class="model-banner-x" id="model-banner-x" aria-label="知道了">×</button>
+  </div>`;
+}
+
+/** 横幅上的两个按钮（每次渲染后绑一次） */
+function bindModelBanner() {
+  const go = document.getElementById("model-banner-go");
+  if (go) go.onclick = () => { location.hash = "#/settings"; };
+  const x = document.getElementById("model-banner-x");
+  if (x) x.onclick = () => { S.bannerOff = true; route(); };
+}
+
+/** Android 专有的后台开关。 */
+function androidBackgroundRows(cf) {
+  const hide = !!cf.hide_ongoing, keep = cf.keep_alive !== false, hideR = !!cf.hide_recents;
+  return setRow(androidSettingLabel("hide_ongoing", "隐藏通知"), "开着时通知栏看不到 Beayy。进程在「应用 → 正在运行」里仍可见；藏起来也可能被系统回收得更快。", `<button class="mx-switch" role="switch" id="hide-ongoing" aria-checked="${hide}" aria-label="隐藏通知"></button>`)
+    + setRow(androidSettingLabel("hide_recents", "隐藏最近任务"), "开着时 Beayy 不出现在多任务切换界面，也降低了被顺手划掉的概率。", `<button class="mx-switch" role="switch" id="hide-recents" aria-checked="${hideR}" aria-label="隐藏最近任务"></button>`)
+    + setRow(androidSettingLabel("keep_alive", "挂了自动拉起来"), "从最近任务划掉、被省电清理掉之后，过几秒自动重启。手机重启也会自己起来（需要「自启动」权限）。", `<button class="mx-switch" role="switch" id="keep-alive" aria-checked="${keep}" aria-label="挂了自动拉起来"></button>`);
+}
 const section = (title, body, { count, aside } = {}) =>
   `<section class="mx-sec"><div class="mx-sec-head"><h3>${esc(title)}</h3>${count != null ? `<span class="mx-count">${count}</span>` : ""}${aside ? `<span class="mx-sec-aside">${aside}</span>` : ""}</div>${body}</section>`;
 const emptyInline = (text) => `<p class="mx-empty-inline">${esc(text)}</p>`;
@@ -152,14 +259,13 @@ const emptyInline = (text) => `<p class="mx-empty-inline">${esc(text)}</p>`;
 const howto = (kind, text) => `<button type="button" class="howto" data-howto="${kind}">${esc(text)}</button>`;
 document.addEventListener("click", (e) => {
   const b = e.target.closest("[data-howto]"); if (!b) return;
-  e.preventDefault(); e.stopPropagation();
-  ({ screentime: screenTimeDialog, amap: amapHowtoDialog })[b.dataset.howto]?.();
+  ({ screentime: ANDROID ? androidPhoneDialog : screenTimeDialog, phone_recording: androidPhoneDialog, phone_capture: androidPhoneDialog, amap: amapHowtoDialog })[b.dataset.howto]?.();
 }, true);
 
 /** iCloud 屏幕使用时间怎么同步到这台 Mac：四步＋打开系统设置、现在读取 */
 function screenTimeDialog() {
   // 手机版不读屏幕使用时间（电脑读），没有这两个按钮
-  const desk = TAURI && !(S.status && S.status.mobile);
+  const desk = TAURI && !(S.status && S.status.mobile) && !IS_WIN;
   openDialog({
     title: "iPhone 屏幕使用时间", cancel: "关闭", ok: desk ? "现在读取" : null, busy: "读取中…",
     body: `<ol class="steps">
@@ -177,7 +283,10 @@ function screenTimeDialog() {
     },
   });
 }
-
+function androidPhoneDialog() {
+  openDialog({ title: "Android 手机记录", cancel: "关闭", ok: null,
+    body: `<p>Android 由 Beayy 在本机采集，不经过 iCloud。要记录完整：到「我的 → 设置 → 通用」开启无障碍、使用情况访问；通知、电池白名单和自启动按需授权。</p><p class="note">无障碍负责读取正在看的界面文字；使用情况访问负责 app 前台时长。密码框不会记录。</p>` });
+}
 /** 高德 Key 怎么获取 */
 function amapHowtoDialog() {
   openDialog({
@@ -642,10 +751,12 @@ function actogram(rows, cur) {
 
 // ---------- 状态 ----------
 
-const S = { days: [], status: null, page: "today", rules: null, settings: null, draft: null };
+const S = { days: [], status: null, page: "today", rules: null, settings: null, draft: null, modelReady: null };
 
 async function boot() {
   [S.days, S.status, S.sync, S.profile] = await Promise.all([call("list_days"), call("get_status"), call("sync_status").catch(() => ({})), call("get_profile").catch(() => ({ name: "我" }))]);
+  S.modelReady = await call("model_ready").catch(() => null);
+  S.bannerOff = false;
   renderSide();
   loadUpdate();
   setInterval(loadUpdate, 10 * 60 * 1000);
@@ -797,18 +908,17 @@ async function renderToday() {
   const d = (await call("get_day", { date: today })) || { date: today };
   const pack = d.pack || {}, c = d.live || pack.computer || {}, ph = d.phone;
   const fda = ((S.status || {}).permissions || {}).full_disk_access;
-  // iPhone 的数据是苹果经 iCloud 传到这台 Mac 的，常晚几个小时；落后 3 小时以上就写明在等苹果，免得以为 Beayy 坏了
-  const phoneLag = "iPhone 的屏幕使用时间由苹果经 iCloud 传到这台 Mac，常晚几个小时，到了 Beayy 才读得到；这段时间没用手机也会停在这里。\niPhone 的「设置 → 屏幕使用时间 → 在设备间共享」要开着";
-  const phoneStale = ph && !past && Date.now() - Date.parse(ph.synced_until) > 3 * 3600e3;
-  const phoneCap = ph ? (past ? (ph.pickups != null ? `拿起 ${ph.pickups} 次` : "") : `同步至 ${ymdhm(ph.synced_until)}${phoneStale ? `\n${phoneLag}` : ""}`)
-    : fda === false ? "未授权完全磁盘访问" : past ? "取不到" : `今天还没有手机数据\n${phoneLag}`;
   const hc = hourMinutes(c.active_hours || {});
   const hp = hourMinutes(ph ? ph.hours : (pack.phone || {}).hours);
+  const phoneLag = ANDROID ? "Android 数据由 Beayy 在本机采集；开启无障碍和使用情况访问后，会记录 app 时长与界面摘要。" : "iPhone 的屏幕使用时间由苹果经 iCloud 传到这台 Mac，常晚几个小时。iPhone 和 Mac 都要打开「屏幕使用时间 → 在设备间共享」。";
+  const phoneStale = ph && !past && Date.now() - Date.parse(ph.synced_until) > 3 * 3600e3;
+  const phoneCap = ph ? (past ? (ph.pickups != null ? `拿起 ${ph.pickups} 次` : "") : `同步至 ${ymdhm(ph.synced_until)}${phoneStale ? `\n${phoneLag}` : ""}`)
+    : ANDROID ? `还没有 Android 手机数据\n${phoneLag}` : fda === false ? "未授权完全磁盘访问" : past ? "取不到" : `今天还没有手机数据\n${phoneLag}`;
   const sp = d.speech, visits = (d.places && d.places.visits) || [];
   // 说话按分钟画，不满 1 分钟的也算 1 分钟，免得零碎的几句看不见
   const hw = sp ? Array.from({ length: 24 }, (_, i) => Math.min(60, Math.ceil(((sp.hours || {})[pad2(i)] || 0) / 60))) : null;
   const items = timelineItems(d);
-  const counts ={ all: items.length, computer: items.filter((x) => x.dev === "computer").length, phone: items.filter((x) => x.dev === "phone" && !x.visit).length };
+  const counts = { all: items.length, computer: items.filter((x) => x.dev === "computer").length, phone: items.filter((x) => x.dev === "phone" && !x.visit).length };
   if (sp) counts.watch = items.filter((x) => x.dev === "watch").length;
   const tab = TL.tab in counts ? TL.tab : "all";
   const shown = items.filter((x) => tab === "all" || x.dev === tab);
@@ -822,16 +932,18 @@ async function renderToday() {
     `<button role="tab" aria-selected="${k === tab}" class="${k === tab ? "is-on" : ""}" data-tab="${k}">${v}<span class="n">${counts[k]}</span></button>`).join("")}</div>`;
   const toolbar = `<div class="toolbar"><div class="toolbar-left"><div class="tabs" role="tablist" id="view-tabs">${[["overview", "全面"], ["timeline", "时间线"], ["places", "地点"]].map(([k, v]) =>
       `<button role="tab" aria-selected="${k === view}" class="${k === view ? "is-on" : ""}" data-view="${k}">${v}</button>`).join("")}</div>
-      ${view === "timeline" ? `<span class="tb-sep"></span>${seg}` : ""}${view === "places" ? `<span class="tb-sep"></span>${pseg}` : ""}</div>
-    <div class="toolbar-right">${ph && !past ? (phoneStale ? `<span class="note tb-note" title="${esc(phoneLag)}">手机停在 ${hm(ph.synced_until)}，在等苹果传来</span>` : `<span class="note tb-note">同步至 ${ymdhm(ph.synced_until)}</span>`) : ""}${view === "places" && pview === "often" ? "" : dayPicker(today, past)}</div></div>`;
+    <div class="toolbar-right">${ph && !past ? (phoneStale ? `<span class="note tb-note" title="${esc(phoneLag)}">${ANDROID ? `手机记录停在 ${hm(ph.synced_until)}` : `手机停在 ${hm(ph.synced_until)}，在等苹果传来`}</span>` : `<span class="note tb-note">同步至 ${ymdhm(ph.synced_until)}</span>`) : ""}${view === "places" && pview === "often" ? "" : dayPicker(today, past)}</div></div>`;
   const overview = `<div class="readouts">
         ${readout("在电脑前", hh(c.active_sec), "h", c.first ? `${c.first}–${c.last}` : "还没有记录")}
         ${readout("手机", ph || fda !== false ? hh(ph ? ph.total_sec : (pack.phone || {}).total_sec) : "—", "h", phoneCap)}
         ${sp ? readout("说话", sp.talk_sec < 3600 ? mins(sp.talk_sec) : hh(sp.talk_sec), sp.talk_sec < 3600 ? "分钟" : "h", sp.first ? `录音 ${hm(sp.first)}–${hm(sp.last)}` : past ? "这一天没有录音" : "今天还没有录音") : ""}
         ${readout("切换", c.switches ?? "—", "次", "应用之间切换")}
         ${visits.length ? readout("去了", new Set(visits.map((v) => v.label || placeName(v).split(" · ")[0])).size, "处", `${visits.length} 段停留`) : ""}
-      </div>
-      <div class="secs-plain" style="margin-top:var(--space-6)">`
+      </div>`
+    + section("手机记录", ANDROID
+      ? `Android 在本机采集 app 使用时长、界面文字、通知、电量和网络状态。${howto("phone_recording", "查看 Android 设置")}`
+      : `iPhone 的屏幕使用时间经 iCloud 同步到 Mac，可能延迟数小时。${howto("screentime", "查看 iPhone 设置")}`)
+    + `<div class="secs-plain" style="margin-top:var(--space-6)">`
     + recentDays(today, { c: c.active_sec, p: ph ? ph.total_sec : (pack.phone || {}).total_sec })
     + section("一天", dayStrip(hc, hp, true, { hw, visits, date: today }) + `<div class="legend"><span><i style="background:var(--rec-computer)"></i>电脑</span><span><i style="background:var(--rec-phone)"></i>手机</span>${sp ? `<span><i style="background:var(--rec-watch)"></i>说话</span>` : ""}${visits.length ? `<span><i style="background:var(--rec-go)"></i>路上</span>` : ""}</div>`)
     + placeTotals(visits, today)
@@ -842,14 +954,18 @@ async function renderToday() {
   }
   const placesView = pview === "often" ? oftenView(PL.stats) : visits.length ? placesSection(visits, today, sp && sp.conversations, pview)
     : emptyInline(past ? "这一天没有停留点" : "今天还没有停留点");
+
+  // 手机独有的信号（通知、媒体、电量、网络）：Android 采的，桌面和 iOS 没有。
+  // 只在「手机」页签下显示，避免把时间线搅乱。
+  const extra = tab === "phone" ? phoneExtraBlock(d.phone_extra) : "";
   const timeline = shown.length ? `<div class="tl" id="tl">${tab === "all" ? hourRows(d, items) : tab === "phone" && visits.length ? phoneByPlace(shown, visits, today) : shown.map(tlRow).join("")}</div>`
     : past ? emptyInline(tab === "phone" ? "这一天没有手机记录" : tab === "watch" ? "这一天没有对话" : "这一天没有记录")
-    : tab === "phone" ? `<p class="mx-empty-inline">手机记录还没同步过来 · ${howto("screentime", "怎么设置")}</p>`
+    : tab === "phone" ? `<p class="mx-empty-inline">${ANDROID ? `Android 手机记录还没有数据 · ${howto("phone_recording", "查看 Android 设置")}` : `iPhone 记录还没有同步 · ${howto("screentime", "查看 iPhone 设置")}`}</p>`
     : emptyInline(tab === "watch" ? "今天还没有对话" : "今天还没有记录");
-
   // 照 Claude 自定义页：标题单独一行；页签和右边的控件（同步时刻、翻日期）同一行
-  $app.innerHTML = header(past ? short(today) : "今天") + toolbar
-    + `<div class="reading">${view === "timeline" ? timeline : view === "places" ? placesView : overview}</div>`;
+  $app.innerHTML = modelBanner() + header(past ? short(today) : "今天") + toolbar
+    + `<div class="reading">${view === "timeline" ? timeline + extra : view === "places" ? placesView : overview}</div>`;
+  bindModelBanner();
   // 地图视图铺满窗口（不受阅读宽度限制）
   $app.classList.toggle("wide", view === "places" && pview === "map");
   if (view === "places" && pview === "map" && visits.length) drawLiveMap(visits, today, PL_SEL.date === today ? PL_SEL.i : null);
@@ -1641,15 +1757,14 @@ function evText(e) {
     case "app.activated": return `切到 ${app}${e.window_title ? ` · ${clip(e.window_title, 50)}` : ""}`;
     case "window.changed": return `${app} 换了窗口${e.window_title ? `：${clip(e.window_title, 50)}` : ""}`;
     case "ui.text": return `读到 ${app} 的界面文字 ${e.lines || 0} 行${e.has_secure_field ? "（有密码框，已打码）" : ""}`;
-    case "heartbeat": return e.state === "idle" ? `没在操作，空闲 ${durText(e.idle_seconds || 0)}` : `在用 ${app}`;
-    case "presence": return e.state === "active" ? "回到电脑前" : `离开电脑（空闲 ${durText(e.idle_seconds || 0)}）`;
-    case "screen.sleep": return "屏幕关了";
+    case "heartbeat": { const mobile = String(e.device || "").startsWith("android-") || String(e.device || "").startsWith("iphone-"); return e.idle_seconds > 180 ? `${mobile ? "手机" : "电脑"}空闲 ${durText(e.idle_seconds || 0)}` : `正在使用${mobile ? "手机" : app || "设备"}`; }
+    case "presence": { const mobile = String(e.device || "").startsWith("android-") || String(e.device || "").startsWith("iphone-"); return e.state === "active" ? (mobile ? "开始使用手机" : "回到电脑前") : `离开${mobile ? "手机" : "电脑"}（空闲 ${durText(e.idle_seconds || 0)}）`; }
     case "screen.wake": return "屏幕亮了";
     case "screen.locked": return "锁屏";
     case "screen.unlocked": return "解锁";
     case "system.sleep": return "电脑睡眠";
     case "system.wake": return "电脑唤醒";
-    case "app.focus": { const n = (ICONS[1][e.bundle_id] || {}).name || String(e.bundle_id || "").split(".").pop(); return `${e.state === "start" ? "打开" : "离开"} ${n}`; }
+    case "app.focus": { const n = (ICONS[1][e.bundle_id] || {}).name || e.app_name || e.bundle_id || "未知应用"; return `${e.state === "start" ? "打开" : "离开"} ${n}`; }
     case "speech.utterance": return `${e.speaker || "未辨"}：${clip(String(e.text || ""), 120)}`;
     case "speech.segment": return `录了一段 ${durText(e.audio_sec || 0)}，有人说话 ${durText(e.speech_sec || 0)}${e.battery != null ? `，电量 ${Math.round(e.battery * 100)}%` : ""}`;
     case "place.visit": return `${e.depart ? "离开" : "到了"} ${e.label || e.name || "没有地名的地方"}`;
@@ -1667,12 +1782,11 @@ function evText(e) {
 }
 
 const hms = (iso) => { const t = new Date(iso); return `${pad2(t.getHours())}:${pad2(t.getMinutes())}:${pad2(t.getSeconds())}`; };
-/** 一条事件的键：时刻＋种类＋第几条（同一秒可能有好几条） */
-const evKey = (e, i) => `${e.timestamp}|${e.event_type}|${i}`;
+const evKey = (e) => `${e.timestamp}|${e.event_type}|${e.bundle_id || ""}|${e.state || ""}|${e.text || e.app_name || ""}`;
 
 function evShell(d) {
-  const kinds = EV_KINDS[d.kind] || EV_KINDS.mac;
-  if (!kinds.includes(DEV.type)) DEV.type = "all";
+  const mobile = ["iphone", "android"].includes(d.kind) || String(d.id).startsWith("android-");
+  const kinds = mobile ? EV_KINDS.iphone : EV_KINDS[d.kind] || EV_KINDS.mac;
   return `<div class="toolbar ev-bar"><div class="toolbar-left"><div class="pick"><button class="mx-btn mx-btn--secondary" id="ev-type" aria-haspopup="menu" aria-expanded="false">${EV_TYPES[DEV.type][0]}${ICON.chevD}</button>
       <div class="mx-menu" role="menu" hidden>${kinds.map((k) => `<button role="menuitemradio" aria-checked="${k === DEV.type}" data-ev-type="${k}">${EV_TYPES[k][0]}${k === DEV.type ? `<span class="mx-check">${ICON.check}</span>` : ""}</button>`).join("")}</div></div></div>
     <div class="toolbar-right"><span class="mx-status ${DEV.live ? "mx-status--ok" : ""}" id="ev-live-state">${DEV.live ? "实时 · 每 3 秒刷新" : "已暂停刷新"}</span><button class="mx-btn mx-btn--text mx-btn--sm" id="ev-live">${DEV.live ? "暂停" : "继续"}</button></div></div>
@@ -1686,8 +1800,15 @@ function bindEvents(d) {
   document.getElementById("ev-live").onclick = () => { DEV.live = !DEV.live; renderDevice(d.id, "events"); };
 }
 
-/** 读事件：older＝接着往前读一页；不然读最新一页，和已经读到的更早的那些接上 */
 async function loadEvents(d, older) {
+  const box = document.getElementById("ev-list");
+  const scrollHost = document.querySelector(".body");
+  const rows = box ? [...box.querySelectorAll(".ev-row")] : [];
+  const top = scrollHost ? scrollHost.getBoundingClientRect().top : 0;
+  const anchor = rows.find((row) => row.getBoundingClientRect().bottom > top);
+  const anchorKey = anchor && anchor.dataset.k;
+  const anchorOffset = anchor ? anchor.getBoundingClientRect().top : 0;
+  const beforeScroll = scrollHost ? scrollHost.scrollTop : 0;
   const types = EV_TYPES[DEV.type][1];
   const before = older && DEV.events.length ? DEV.events[DEV.events.length - 1].timestamp : null;
   let r;
@@ -1703,6 +1824,10 @@ async function loadEvents(d, older) {
     if (!keep.length) DEV.more = r.more;
   }
   drawEvents(d);
+  if (!older && scrollHost && scrollHost.isConnected) {
+    const next = anchorKey && [...document.querySelectorAll(".ev-row")].find((row) => row.dataset.k === anchorKey);
+    scrollHost.scrollTop = next ? scrollHost.scrollTop + next.getBoundingClientRect().top - anchorOffset : beforeScroll;
+  }
 }
 
 function drawEvents(d) {
@@ -1710,13 +1835,12 @@ function drawEvents(d) {
   DEV.drawn = true;
   if (DEV.err) { box.innerHTML = `<p class="mx-error">读不到事件：${esc(DEV.err)}</p>`; return; }
   if (!DEV.events.length) { box.innerHTML = emptyInline("最近 8 小时没有这类事件"); return; }
-  const phone = d.kind === "iphone";
+  const phone = ["iphone", "android"].includes(d.kind) || String(d.id).startsWith("android-");
   box.innerHTML = `<div class="ev-list">${DEV.events.map((e, i) => {
     const k = evKey(e, i), app = e.bundle_id && (e.app_name || phone) ? `<span class="ico" data-b="${esc(e.bundle_id)}" data-p="${phone ? 1 : 0}" title="${esc(e.app_name || e.bundle_id)}">${esc(((e.app_name || e.bundle_id.split(".").pop())[0] || "?").toUpperCase())}</span>` : `<span class="ico ico-none"></span>`;
     const raw = JSON.stringify(e, null, 2);
     const extra = e.event_type === "ui.text" && e.text ? `<pre class="ev-text">${esc(clip(String(e.text), 2000))}</pre>` : "";
-    return `<details class="ev-row" data-k="${esc(k)}"${DEV.open.has(k) ? " open" : ""}><summary><span class="t mono">${hms(e.timestamp)}</span><span class="mx-tag">${esc(evTag(e.event_type))}</span>${app}<span class="ev-say">${esc(evText(e))}</span></summary>
-      <div class="ev-more">${extra}<pre class="ev-raw mono">${esc(raw)}</pre></div></details>`;
+    return `<details class="ev-row" data-k="${esc(k)}"${DEV.open.has(k) ? " open" : ""}><summary><span class="t mono">${hms(e.timestamp)}</span><span class="mx-tag">${esc(evTag(e.event_type))}</span>${app}<span class="ev-say">${esc(evText(e))}</span></summary><div class="ev-more">${extra}<pre class="ev-raw mono">${esc(raw)}</pre></div></details>`;
   }).join("")}</div>${DEV.more ? `<div class="btns ev-older"><button class="mx-btn mx-btn--secondary mx-btn--sm" id="ev-older">加载更早</button></div>` : ""}`;
   box.querySelectorAll(".ev-row").forEach((x) => x.addEventListener("toggle", () => { x.open ? DEV.open.add(x.dataset.k) : DEV.open.delete(x.dataset.k); }));
   const older = document.getElementById("ev-older"); if (older) older.onclick = () => loadEvents(d, true);
@@ -1845,8 +1969,9 @@ const PJ = { err: null, list: null };
 
 function profileRow() {
   const pf = S.profile || { name: "我" };
-  return `<div class="mx-setting"><div class="profile"><span class="avatar big">${avatarHtml(pf)}</span><div><div class="mx-setting-name">${esc(pf.name)}</div><div class="mx-setting-desc">${pf.email ? esc(pf.email) : "显示在左下角"}</div></div></div>
-      <button class="mx-btn mx-btn--secondary mx-btn--sm" id="pf-edit">编辑</button></div>`;
+  const identity = `<div class="profile"><span class="avatar big">${avatarHtml(pf)}</span><div><div class="mx-setting-name">${esc(pf.name)}</div><div class="mx-setting-desc">${pf.email ? esc(pf.email) : "显示在左下角"}</div></div></div>`;
+  if (ANDROID) return `<div class="profile-setting">${identity}<button class="mx-btn mx-btn--secondary mx-btn--sm" id="pf-edit">更改</button></div>`;
+  return `<div class="mx-setting">${identity}<button class="mx-btn mx-btn--secondary mx-btn--sm" id="pf-edit">编辑</button></div>`;
 }
 
 /** 选的图片居中裁成方的、缩到 128 像素，转成 JPEG data URL */
@@ -1870,12 +1995,13 @@ function profileDialog() {
   let avatar;
   openDialog({
     title: "编辑个人资料", ok: "保存",
-    body: `<div class="profile"><span class="avatar big" id="pf-av">${avatarHtml(pf)}</span>
-        <div class="btns sync-btns"><button class="mx-btn mx-btn--secondary mx-btn--sm" id="pf-pick">换头像</button><button class="mx-btn mx-btn--text mx-btn--sm" id="pf-clear">用名字首字</button><input type="file" id="pf-file" accept="image/*" hidden></div></div>
-      ${dlgField("pf-name", "名称", { value: pf.name || "", help: "" })}`,
+    body: ANDROID
+      ? `${dlgField("pf-name", "名称", { value: pf.name || "", help: "修改后会同步到侧栏和设备记录" })}`
+      : `<div class="profile"><span class="avatar big" id="pf-av">${avatarHtml(pf)}</span><div class="btns sync-btns"><button class="mx-btn mx-btn--secondary mx-btn--sm" id="pf-pick">换头像</button><button class="mx-btn mx-btn--text mx-btn--sm" id="pf-clear">用名字首字</button><input type="file" id="pf-file" accept="image/*" hidden></div></div>${dlgField("pf-name", "名称", { value: pf.name || "", help: "" })}`,
     onOpen: (el, d) => {
-      const av = el.querySelector("#pf-av"), file = el.querySelector("#pf-file"), name = el.querySelector("#pf-name");
-      name.maxLength = 40;
+      const name = el.querySelector("#pf-name"); name.maxLength = 40;
+      if (ANDROID) return;
+      const av = el.querySelector("#pf-av"), file = el.querySelector("#pf-file");
       const show = () => (av.innerHTML = avatarHtml({ name: name.value.trim() || pf.name, avatar: avatar === undefined ? pf.avatar : avatar }));
       name.oninput = show;
       el.querySelector("#pf-pick").onclick = () => file.click();
@@ -1885,7 +2011,7 @@ function profileDialog() {
     submit: async (el) => {
       const name = dlgVal(el, "pf-name");
       if (!name) throw "名称不能空。";
-      await call("save_profile", { name, avatar: avatar === undefined ? pf.avatar || null : avatar });
+      await call("save_profile", { name, avatar: ANDROID ? null : (avatar === undefined ? pf.avatar || null : avatar) });
       S.profile = await call("get_profile"); renderSide(); renderSettings();
     },
   });
@@ -1900,8 +2026,8 @@ const DOMAINS = ["工作", "成长", "生活", "健康", "关系", "休闲"];
 
 function projectsSection() {
   const list = PJ.list || [];
-  if (!list.length) return "";
   const dur = (sec) => (sec < 3600 ? Math.round(sec / 60) + " 分钟" : hh(sec) + " 小时");
+  if (!list.length) return section("项目", `<p class="note">项目来自 10 分钟摘要中的模型标注。当前还没有带项目标签的摘要，先使用一段时间后会自动出现；也可以先设置模型。</p>`);
   const byDom = DOMAINS.map((d) => [d, list.filter((p) => p.domain === d)]).filter(([, xs]) => xs.length);
   const rows = byDom.map(([d, xs]) => `<div class="pj-group">${d}</div>` + xs.map((p) => `<div class="pj-row" data-p="${esc(p.name)}">
       <div class="pj-main"><div class="mx-setting-name">${esc(p.name)}</div><div class="mx-setting-desc">累计 ${dur(p.sec)}${p.aliases.length ? ` · 也叫 ${esc(p.aliases.join("、"))}` : ""}</div></div>
@@ -2129,14 +2255,14 @@ function addPlaceDialog() {
 
 /** 设置分六页，放在页头的页签里：通用｜账号｜记录｜连接｜数据｜项目。改了就存，不再有「保存设置」；要填几项的（地址、模型、密钥）开小弹层 */
 const SET_TABS = [["general", "通用"], ["account", "账号"], ["record", "记录"], ["connect", "连接"], ["data", "数据"], ["projects", "项目"]];
-try { SS.tab = localStorage.getItem("settings-tab") || "general"; } catch (e) { SS.tab = "general"; }
+const setRow = (name, desc, right) => { const cls = ANDROID && typeof name === "string" && name.includes("android-setting-label") ? " android-setting-row" : ""; return `<div class="mx-setting${cls}"><div class="mx-setting-main"><div class="mx-setting-name">${name}</div>${desc ? `<div class="mx-setting-desc">${desc}</div>` : ""}</div>${right}</div>`; };
 const hostOf = (u) => { try { return new URL(u).host; } catch (e) { return u || ""; } };
-const setRow = (name, desc, right) => `<div class="mx-setting"><div class="mx-setting-main"><div class="mx-setting-name">${name}</div>${desc ? `<div class="mx-setting-desc">${desc}</div>` : ""}</div>${right}</div>`;
 const smallBtn = (id, text, attrs = "") => `<button class="mx-btn mx-btn--secondary mx-btn--sm" id="${id}" ${attrs}>${text}</button>`;
 const pill = (ok, text) => `<span class="mx-status mx-status--${ok ? "ok" : "warn"}">${text}</span>`;
 /** 只改几个键：save_settings 只写传进去的键 */
 async function saveSome(part) {
   await call("save_settings", { settings: part });
+  if (ANDROID && window.AndroidBridge && typeof window.AndroidBridge.refreshSettings === "function") window.AndroidBridge.refreshSettings();
   S.settings = await call("get_settings"); S.draft = JSON.parse(JSON.stringify(S.settings));
 }
 const isUrl = (v) => /^https?:\/\/\S+$/.test(v);
@@ -2163,10 +2289,10 @@ async function renderSettings() {
   if (tab === "general") {
     const mobile = !!st.mobile;
     body = section("个人资料", profileRow())
-      + (mobile ? phoneSection() : "")
-      + section("通用", (mobile ? "" : setRow("开机自动启动", "登录电脑后自动开始记录。", `<button class="mx-switch" role="switch" id="login" aria-checked="${!!st.login_item}" aria-label="开机自动启动"></button>`))
+      + (mobile ? (ANDROID ? androidPermissionSection() : phoneSection()) : "")
+      + section("通用", (mobile ? (ANDROID ? androidBackgroundRows(cf) : "") : setRow("开机自动启动", "登录电脑后自动开始记录。", `<button class="mx-switch" role="switch" id="login" aria-checked="${!!st.login_item}" aria-label="开机自动启动"></button>`))
         + setRow("主题", "", `<div class="mx-seg" role="tablist" id="theme">${THEMES.map(([k, v]) => `<button role="tab" aria-selected="${k === theme}" class="${k === theme ? "is-on" : ""}" data-theme="${k}">${v}</button>`).join("")}</div>`))
-      + (mobile ? section("关于", setRow(`版本 ${esc(st.version || "")}`, "手机版跟着 TestFlight 更新。", "")) : aboutSection());
+      + (mobile ? section("关于", setRow(`版本 ${esc(st.version || "")}`, "手机版版本。", "")) : aboutSection());
   } else if (tab === "account") {
     body = sy.shadow ? section("账号", emptyInline("测试版不登录账号")) : section("账号与同步", accountBody(sy));
   } else if (tab === "record") {
@@ -2200,7 +2326,7 @@ async function renderSettings() {
         + (L.plan === "official" ? useRow("模型", L.llm, official, tokens) + useRow("转写", L.asr, asrOfficial, minutes) + useRow("地图", L.map, mapOfficial, calls) : ""))
       + section("每一项", (official
       ? setRow("模型", "官方", smallBtn("c-model", "设置"))
-      : setRow("模型", `自己的网关 · <span class="mono">${esc(hostOf(cf.gateway))} · ${esc(cf.model_segment || "没填模型")}</span>`, `${pill(!!ks, ks ? "密钥已存" : "没有密钥")}${smallBtn("c-model", "设置")}`))
+      : setRow("模型", `自己的网关 · <span class="mono">${esc(hostOf(cf.gateway))} · ${esc(cf.model_segment || "没填模型")}</span>${modelSyncHint(cf)}`, `${pill(!!ks, ks ? "密钥已存" : "没有密钥")}${smallBtn("c-model", "设置")}`))
       + setRow("转写服务", `${asrOfficial ? "官方" : `自建 · <span class="mono">${esc(hostOf(cf.transcribe_server))}</span>`} · 你叫「${esc(cf.speaker_name)}」${st.cloud_sync ? `<br>${esc(st.cloud_sync)}` : ""}`, smallBtn("c-asr", "设置"))
       + setRow("高德地图", mapOfficial ? "官方" : "自己的 Key", `${mapOfficial ? "" : amap}${smallBtn("c-amap", "设置")}`)
       + setRow("同步服务器", `<span class="mono">${esc(hostOf(cf.sync_server))}</span>${cf.sync_server === cf.default_sync_server ? " · 官方" : " · 自建"}`, smallBtn("c-sync", "更改", syncLocked ? `disabled title="登录着不能换，先在「账号」里退出"` : ""))
@@ -2220,7 +2346,7 @@ async function renderSettings() {
   const on = (id, f) => { const el = document.getElementById(id); if (el) el.onclick = f; };
   if (tab === "general") {
     bindProfile(); if (!st.mobile) bindAbout();
-    if (st.mobile) bindPhone();
+    if (st.mobile) { if (ANDROID) bindAndroidPermissions(); else bindPhone(); }
     document.getElementById("theme").onclick = (e) => {
       const b = e.target.closest("button"); if (!b) return;
       const t = b.dataset.theme;
@@ -2229,6 +2355,10 @@ async function renderSettings() {
       renderSettings();
     };
     on("login", async () => { try { await call("set_login_item", { on: !st.login_item }); } catch (x) { alert(`没改成：${x}`); } renderSettings(); });
+    // Android 两个后台开关：直接存设置，服务每分钟读一次就生效，不用重启
+    on("hide-ongoing", async () => { await saveSome({ hide_ongoing: !cf.hide_ongoing }); renderSettings(); });
+    on("hide-recents", async () => { await saveSome({ hide_recents: !cf.hide_recents }); renderSettings(); });
+    on("keep-alive", async () => { await saveSome({ keep_alive: cf.keep_alive === false }); renderSettings(); });
   }
   if (tab === "account" && !sy.shadow) bindAccount();
   if (tab === "projects") bindProjects();
@@ -2284,6 +2414,30 @@ async function renderSettings() {
   }
 }
 
+/** Android 设置里的采集权限：状态由原生桥读取，点击后跳到对应系统页。 */
+function androidPermissionSection() {
+  const p = SS.androidPermissions;
+  if (!p) return section("这台手机", emptyInline("在看权限状态……"));
+  if (p.error) return section("这台手机", `<div class="mx-field-error">${esc(p.error)}</div>`);
+  const rows = [["accessibility", "无障碍", "读取正在看的界面文字，生成语义摘要主要靠它"], ["usage", "使用情况访问", "记录每个 app 用了多久、什么时候在前台"], ["notifications", "通知使用权", "记录谁来找过你；正文默认不记"], ["battery", "电池优化白名单", "避免息屏后后台被冻结、记录断档"], ["auto_start", "自启动", "国产 ROM 需要在系统设置里放行"]];
+  return section("这台手机", rows.map(([key, name, desc]) => {
+    const known = typeof p[key] === "boolean";
+    const ok = known && p[key];
+    const text = key === "auto_start" ? "需按手机品牌设置，无法自动读取" : (ok ? "已授权" : "未授权");
+    const action = (!ok || key === "auto_start") ? smallBtn(`android-perm-${key}`, "去设置") : "";
+    return setRow(androidSettingLabel(key, name), desc, `${pill(ok, text)}${action}`);
+  }).join(""));
+}
+function bindAndroidPermissions() {
+  const load = () => {
+    try { SS.androidPermissions = JSON.parse(window.AndroidBridge.permissions()); }
+    catch (x) { SS.androidPermissions = { error: String(x) }; }
+    if (S.page === "settings" && SS.tab === "general" && !document.querySelector(".dlg-root")) renderSettings();
+  };
+  if (!SS.androidPermAt || Date.now() - SS.androidPermAt > 5e3) { SS.androidPermAt = Date.now(); load(); }
+  $app.querySelectorAll("[id^=android-perm-]").forEach((el) => { el.onclick = () => { window.AndroidBridge.openPermission(el.id.slice("android-perm-".length)); }; });
+  window.__beayyAndroidResumed = () => { SS.androidPermAt = 0; load(); };
+}
 /** 手机版设置「通用」里的「这台手机」：定位、手表、用这台 iPhone 录、本人声纹、上传进度（原生做的，经 native_ 命令） */
 function phoneSection() {
   const n = SS.native;
@@ -2318,7 +2472,8 @@ function storageView(d) {
   if (d.error) return section("数据", `<div class="mx-field-error">${esc(d.error)}</div>`);
   const table = (rows, cols) => `<table class="mx-table store"><thead><tr>${cols.map((c) => `<th${c[2] ? ' class="num"' : ""}>${c[0]}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${cols.map((c) => `<td${c[2] ? ' class="num mono"' : ""}>${c[1](r)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
   const L = d.local, C = d.cloud, T = d.transcribe;
-  const local = section("本机", setRow("数据目录", `<span class="mono">${esc((L.path || "").replace(/^\/Users\/[^/]+/, "~"))}</span> · 共 ${bytesText(L.total)}`, (S.status && S.status.mobile ? "" : smallBtn("open-dir", "在访达中打开")))
+  const localPath = `<span class="mono storage-path">${esc((L.path || "").replace(/^\/Users\/[^/]+/, "~"))}</span>`;
+  const local = section("本机", setRow("数据目录", `${localPath} · 共 ${bytesText(L.total)}`, (S.status && S.status.mobile ? "" : smallBtn("open-dir", "打开目录")))
     + table(L.items, [["内容", (r) => esc(r.name)], ["大小", (r) => bytesText(r.bytes), 1], ["留多久", (r) => esc(r.keep)]]), { aside: "全部数据，以这里为准" });
   const cloud = section("同步服务", C.error ? emptyInline(C.error)
     : `<p class="note" style="margin:0 0 var(--space-3)"><span class="mono">${esc(hostOf(C.server))}</span> · 共 ${bytesText(C.total)}</p>`
@@ -2326,7 +2481,7 @@ function storageView(d) {
   const jobs = T.jobs ? Object.entries(T.jobs).map(([k, n]) => `${{ queued: "排队", running: "在转", done: "转好待取", failed: "失败" }[k] || k} ${n}`).join("、") : "";
   const asr = section("转写服务", T.error ? `<p class="note" style="margin:0"><span class="mono">${esc(hostOf(T.server))}</span></p>${emptyInline(T.error)}`
     : setRow(`<span class="mono">${esc(hostOf(T.server))}</span>`, `${jobs || "没有你的任务"} · 占 ${bytesText(T.bytes)}`, `<span class="note">${esc(T.keep)}</span>`));
-  const repo = section("人生记录仓库", setRow(d.repo ? `<span class="mono">${esc((d.repo.path || "").replace(/^\/Users\/[^/]+/, "~"))}</span>` : "没填",
+  const repo = section("人生记录仓库", setRow(d.repo ? `<span class="mono storage-path">${esc((d.repo.path || "").replace(/^\/Users\/[^/]+/, "~"))}</span>` : "没填",
     d.repo ? `raw/ 共 ${bytesText(d.repo.bytes)} · ${esc(d.repo.keep)}` : "日数据包和日总结的文件夹", smallBtn("repo-edit", "更改")));
   return local + cloud + asr + repo + `<p class="note">${d.at ? `${hm(new Date(d.at).toISOString())} 取的，开着这一页每分钟更新。` : ""}</p>`;
 }

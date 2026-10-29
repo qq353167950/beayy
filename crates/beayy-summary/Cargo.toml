@@ -1,15 +1,23 @@
 [package]
 name = "beayy-summary"
-description = "10 分钟摘要：把电脑事件按分段算时长、去重、拼包，调模型写成和 Codex 10min-memory-summary 同格式的 Markdown"
+description = "10 分钟摘要、小时摘要、两级分类（类型、领域·项目）、项目名合并"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["native-tls"]
+native-tls = ["ureq/native-tls", "beayy-sync/native-tls"]
+# Android NDK 没有可用的系统 TLS 库，走 rustls + 内置根证书
+rustls = ["ureq/rustls", "beayy-sync/rustls"]
+
 [dependencies]
 beayy-core.workspace = true
-beayy-sync.workspace = true
+# 写路径 + default-features = false：TLS 后端只由本 crate 的 feature 决定（见上）。
+beayy-sync = { path = "../beayy-sync", default-features = false }
 serde_json.workspace = true
 chrono.workspace = true
 regex = "1"
-# 系统 TLS（macOS Security 框架、Windows SChannel），不用编 C，Mac 上也能交叉检查 Windows
-ureq = { version = "3", default-features = false, features = ["json", "native-tls"] }
+# 系统 TLS（macOS Security 框架、Windows SChannel），不用编 C，Mac 上也能交叉检查 Windows。
+# Android 用 --no-default-features --features rustls。
+ureq = { version = "3", default-features = false, features = ["json"] }

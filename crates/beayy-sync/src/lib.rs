@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const DEFAULT_SERVER: &str = "https://sync.beayy.com";
+pub const DEFAULT_SERVER: &str = "https://6000-agqwfq6g2fpunw4so7aocow6pu.instabox.tech";
 const CODE_PREFIX: &str = "beayy-sync-1:";
 const PARALLEL: usize = 8;
 /// 下载并发：每块都要过一次鉴权查库，单次慢，多开几路
@@ -134,10 +134,23 @@ fn reset_state_for(root: &Path, user: &str) {
 // ---------- HTTP ----------
 
 fn agent() -> ureq::Agent {
-    // 根证书用系统的（macOS 钥匙串、Windows 证书库）：ureq 默认的内置清单会关掉系统根证书，Windows 上验不过 Cloudflare 的证书链
+    // 根证书的来源按平台选：
+    // - 桌面（默认 feature native-tls）：用系统根证书（macOS 钥匙串、Windows 证书库）。
+    //   ureq 内置的清单会关掉系统根证书，Windows 上验不过 Cloudflare 的证书链。
+    // - Android（feature rustls）：NDK 没有可用的系统 TLS 库，改用 rustls + ureq 自带的根证书。
+    #[cfg(not(feature = "rustls"))]
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    #[cfg(feature = "rustls")]
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .root_certs(ureq::tls::RootCerts::WebPki)
+        .build();
     ureq::Agent::config_builder()
         .proxy(None)
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(tls)
         .timeout_global(Some(Duration::from_secs(60)))
         .http_status_as_error(false)
         .build()
@@ -581,7 +594,7 @@ fn sync_round(root: &Path, local_device: &str, upload: bool) -> Option<Report> {
     let devs = fs::read_dir(root.join("devices")).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()).unwrap_or_default();
     for dev in devs {
         let d = dev.file_name().to_string_lossy().to_string();
-        let mine = d == local_device || (d.starts_with("iphone-") && !is_remote(root, &st, &d));
+        let mine = d == local_device || (beayy_core::is_phone(&d) && !is_remote(root, &st, &d));
         if !upload || !mine || !safe_name(&d) || !dev.path().is_dir() {
             continue;
         }
@@ -703,7 +716,7 @@ fn sync_round(root: &Path, local_device: &str, upload: bool) -> Option<Report> {
             if is_special(d, n) {
                 return false;
             }
-            let mine = d == local_device || (d.starts_with("iphone-") && root.join("devices").join(d).exists() && !is_remote(root, &st, d));
+            let mine = d == local_device || (beayy_core::is_phone(d) && root.join("devices").join(d).exists() && !is_remote(root, &st, d));
             !mine && safe_name(d) && safe_name(n)
         };
         let want: Vec<bool> = items.iter().map(wanted).collect();
@@ -741,7 +754,14 @@ fn sync_round(root: &Path, local_device: &str, upload: bool) -> Option<Report> {
                 }
                 out
             });
-            for ((it, _), got) in batch.iter().zip(fetched) {
+            // 游标只推进到「这一批全部成功处理完」的位置。
+            //
+            // 原来是在每个 item 之后无条件推进 since，即使那一项是「不要的」（不是我的设备、
+            // 或者 is_special 的录音块）。那样有个隐患：某台设备当时不归我（比如还没登录、
+            // 或者目录还没建成），它的条目被跳过但游标推过去了，之后这台设备变成「我的」
+            // 也再拉不回来——因为 since 已经越过它。宁可慢一点，也别丢数据。
+            let mut batch_max = st.since;
+            for ((it, want), got) in batch.iter().zip(fetched) {
                 let (d, n) = (it["device"].as_str().unwrap_or(""), it["segment"].as_str().unwrap_or(""));
                 if let Some(got) = got {
                     match got.and_then(|plain| store(root, d, n, plain)) {
@@ -753,13 +773,25 @@ fn sync_round(root: &Path, local_device: &str, upload: bool) -> Option<Report> {
                             if errors.len() < 10 {
                                 errors.push(format!("下载 {d}/{n}：{e}"));
                             }
+                            // 这一批不推游标就退出：下次从这一批的开头重来
                             write_state(root, &st);
                             return Some(finish(root, st, uploaded, downloaded, errors));
                         }
                     }
+                } else if *want {
+                    // 要的、却没拿到（并行任务那里没给值）：这是异常，别越过它——
+                    // 不推游标就退出，下次重来。宁可重复下载，也不能悄悄丢数据。
+                    if errors.len() < 10 {
+                        errors.push(format!("下载 {d}/{n}：没拿到内容，下次重试"));
+                    }
+                    write_state(root, &st);
+                    return Some(finish(root, st, uploaded, downloaded, errors));
                 }
-                st.since = st.since.max(it["updated"].as_i64().unwrap_or(0));
+                // 走到这里：要么成功存下了，要么本来就不要（别人的设备、录音块）。
+                // 这两种都算「处理过了」，可以越过去。
+                batch_max = batch_max.max(it["updated"].as_i64().unwrap_or(0));
             }
+            st.since = batch_max;
             write_state(root, &st);
         }
         if !full {

@@ -5,6 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# 默认用系统根证书（macOS 钥匙串、Windows 证书库）：ureq 内置的清单会关掉系统根证书，
+# Windows 上验不过 Cloudflare 的证书链
+default = ["native-tls"]
+native-tls = ["ureq/native-tls"]
+# Android NDK 上没有系统 TLS 库可用，走 rustls + 内置根证书
+rustls = ["ureq/rustls"]
+
 [dependencies]
 beayy-core.workspace = true
 serde_json.workspace = true
@@ -13,7 +21,7 @@ chacha20poly1305 = "0.10"
 miniz_oxide = "0.8"
 base64 = "0.22"
 getrandom = "0.2"
-ureq = { version = "3", default-features = false, features = ["json", "native-tls"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
 argon2 = "0.5"
 hkdf = "0.12"
 sha2 = "0.10"

@@ -189,14 +189,33 @@ pub struct PullNote {
 }
 
 fn agent() -> ureq::Agent {
-    // 根证书用系统的（同 beayy-sync）
+    // 根证书来源跟 beayy-sync 一致，见下面的 tls_config()
     ureq::Agent::config_builder()
         .proxy(None)
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .tls_config(tls_config())
         .timeout_global(Some(Duration::from_secs(60)))
         .http_status_as_error(false)
         .build()
         .into()
+}
+
+/// TLS 配置：桌面用系统根证书（macOS 钥匙串、Windows 证书库）；
+/// Android（feature rustls）用 rustls + ureq 自带的根证书，因为 NDK 没有系统 TLS 库。
+pub fn tls_config() -> ureq::tls::TlsConfig {
+    #[cfg(not(feature = "rustls"))]
+    {
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::NativeTls)
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build()
+    }
+    #[cfg(feature = "rustls")]
+    {
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::Rustls)
+            .root_certs(ureq::tls::RootCerts::WebPki)
+            .build()
+    }
 }
 
 fn state_path(root: &Path) -> std::path::PathBuf {
