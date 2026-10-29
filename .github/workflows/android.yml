@@ -67,9 +67,9 @@ jobs:
       # 顺带确认没有把 native-tls／openssl 拖进来
       - name: 断言没链 openssl
         run: |
-          if cargo tree -p beayy-mobile --no-default-features --features rustls \
-               --target aarch64-linux-android -i openssl-sys 2>&1 | grep -q openssl-sys; then
-            echo "::error::Android 构建里出现了 openssl-sys（说明某个 crate 的 default feature 没关）"
+          tree="$(cargo tree -p beayy-mobile --no-default-features --features rustls --target aarch64-linux-android)"
+          if printf '%s\n' "$tree" | grep -Eiq '(^|[[:space:]])openssl(-sys)? v'; then
+            echo "::error::Android 构建里出现了 openssl/openssl-sys（说明某个 crate 的 default feature 没关）"
             exit 1
           fi
           echo "没有 openssl 依赖"
